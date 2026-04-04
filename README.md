@@ -112,8 +112,6 @@ Committed plots under **`results/figures/`** (Bias in Bios, predefined splits; c
   <img src="./results/figures/occupation_distribution.png" alt="Bias in Bios: occupation counts on train split" width="720" />
 </p>
 
-*If images do not show in the editor preview, open the PNG paths above in the file tree, or view the README on GitHub after pushing (remote rendering resolves the same paths).*
-
 **Regenerate plots** (default output names: `bias_in_bios_split_sizes.png`, `bias_in_bios_gender_train.png`, `bias_in_bios_occupation_train.png` in `results/figures/`):
 
 ```bash
