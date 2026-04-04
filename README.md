@@ -106,7 +106,7 @@ python scripts/run_bias_in_bios_stats.py
 python run_all_baselines.py
 ```
 
-Useful flags: `--quick`, `--epochs N`, `--batch-size N`, `--max-length N`, `--no-lora`, `--model Qwen/Qwen2.5-0.5B`. Outputs: `results/report_*.json`, `results/report_*.md`, updates `results/baseline_comparison.json`.
+Useful flags: `--quick`, `--epochs N`, `--batch-size N`, `--max-length N`, `--no-lora`, `--model Qwen/Qwen2.5-0.5B`, `--skip-agentic-report` (skips TABLE 0–5 reload/eval). Outputs: `results/report_*.json`, `results/report_*.md`, `results/baseline_comparison.json`, and **`results/agentic_report_all_baselines_*.md`** + **`.json`** (same sections as `run_agentic_baselines.py`: three claims, TABLE 0–5, full dump, supporting biography table).
 
 ### 2) Single baseline (compact entry point)
 
@@ -122,7 +122,7 @@ python main.py --baseline b3
 python run_agentic_baselines.py
 ```
 
-Defaults are set in the `CONFIG` `SimpleNamespace` inside `main()` (no CLI). Agentic inner loop uses `DEFAULT_ADAPTATION_STEPS` and `DEFAULT_ADAPTATION_LR` from `config.py`.
+Defaults are set in the `CONFIG` `SimpleNamespace` inside `main()` (no CLI). Agentic inner loop uses `DEFAULT_ADAPTATION_STEPS` and `DEFAULT_ADAPTATION_LR` from `config.py`. Writes `results/agentic_report_*.md` / `.json` with the **same markdown structure** as the demo / `run_all_baselines` agentic bundle (title line differs: *run_agentic_baselines* vs *run_all_baselines*).
 
 ### 4) End-to-end demo (tiny split, fast sanity check)
 
@@ -134,116 +134,38 @@ See `demo/README.md` for `--cpu`, `--skip-main`, `--adapt-objective`, `--adapt-l
 
 ---
 
-## Key results (examples)
+## Key results (light)
 
-Values below are **snapshots** for grading and reporting; **reproduce** with `python run_all_baselines.py` (static sweep) and `python demo/run_demo.py` (agentic demo). Machine-readable copies: `results/baseline_comparison.json`, `demo/output/demo_agentic_report.md` / `.json` after a demo run.
+**Paper spine (three claims):** (1) lower **E_bio** on biographies after debiasing vs B_task; (2) bias can **return** after LM task-shift on bios (TABLE 0) and under agentic steps (TABLE 2–3); (3) **Main** keeps **E1 ≈ E3** (small trajectory ΔE) without collapsing task accuracy. Full TABLE 0–5 + metric dumps → generated `.md` next to each `.json` below.
 
-### Static baselines (Bias in Bios subset + CrowS + BBQ)
+### Static baselines (CrowS / BBQ snapshot)
 
-Representative row from `results/baseline_comparison.json` (run 2026-02-21, controlled split, Qwen2.5-0.5B):
+From `results/baseline_comparison.json` (2026-02-21-style run): B1/B2 ~100% occ. acc; B3 lower; R(θ) ~0.49–0.53; LoRA ΔR example **+0.0344**. Regenerate with `python run_all_baselines.py`.
 
-| Model | Task acc % | R(θ) probe | CrowS-Pairs % | BBQ acc % |
-|-------|------------|------------|---------------|-----------|
-| B1 standard | 100.0 | 0.488 | 51.33 | 29.40 |
-| B2 adversarial | 100.0 | 0.531 | 50.07 | 25.43 |
-| B3 INLP | 75.0 | 0.494 | 51.92 | 28.91 |
+### Agentic — full split (committed snapshot)
 
-LoRA **ΔR** (that run): **+0.0344** (see JSON for meta).
+**Files:** [JSON](results/agentic_report_20260403_122754.json) · [Markdown](results/agentic_report_20260403_122754.md) (same run).  
+**Setup:** Bios train=4000, val=1000, test=2000 · Qwen2.5-0.5B · cuda:9 · seed 42 · epochs 3 · batch 8 · max_length 256 · λ1=1.5, λ2=0.1 · B2 LoRA r=16, α=32 · adaptation_steps=4, adaptation_lr=1e-4.
 
-### Agentic baseline report (demo — tiny split)
+| Model | E_bio | E1 | E3 | ΔE (E3−E1) | Final occ. acc % |
+|-------|-------|-----|-----|------------|------------------|
+| B_task | 0.8783 | 0.9779 | 0.9668 | −0.0111 | 86.45 |
+| B_adv | 0.823 | 0.8009 | 0.7677 | −0.0332 | 65.65 |
+| B_static_inlp | 0.9004 | 0.9723 | 0.9779 | +0.0055 | 68.45 |
+| Main | 0.7013 | 0.5741 | 0.5741 | 0.0 | 73.9 |
 
-Run: `python demo/run_demo.py` (default tiny split: 96 train / 24 val / 32 test; demo mild λ, LM summarize task-shift for TABLE 0 + inner loop). Snapshot below: **2026-04-03** (regenerate locally for exact match).
+**TABLE 0 (LM summarize on bios, ΔE_bio):** B_task −0.0166 · B_adv −0.0221 · B_static_inlp 0.0 · Main +0.0222 — see `table0_pure_bio_task_ft` in the JSON.
 
-#### Three claims (paper spine)
+### Agentic — demo (tiny split, quick)
 
-| Claim | What to show | Tables |
-|-------|----------------|--------|
-| **1 — Debiasing works (initially)** | Lower excess recoverability on biography inputs: **E_bio** (B_adv, INLP) **<** B_task | **TABLE 1** |
-| **2 — Bias returns** | **TABLE 0:** after task-shift adaptation on bios (default: **LM summarize**), **E_after > E_before**. **TABLE 2–3:** agentic lift + step drift | **TABLE 0** (isolated), **TABLE 2–3** |
-| **3 — Main stabilizes** | After **Main**: **E1 ≈ E_bio**, **E3 ≈ E1**, small **ΔE**; task accuracy not collapsed | **TABLE 4** + **TABLE 5** |
+**Files:** `demo/output/demo_agentic_report.json` / `.md` after `python demo/run_demo.py` (default **96 / 24 / 32** bios, milder λ). Full tables in those files; **excerpt** (same metrics as above):
 
-#### TABLE 0 — Pure fine-tuning effect (no prompt change)
-
-Same tokenized biographies: extra task loss on the **train** split (**bias head frozen** for B_adv), then re-probe **test** bios for gender (unchanged linear probe on pooled states). **Positive ΔE** on B_adv → representation shift revives recoverable bias under adaptation.
-
-**Default task shift:** causal LM on *“Summarize this biography.”* + biography + short pseudo-summary target; classification heads frozen; backbone (e.g. LoRA) updates; gender probe on pooled **h** unchanged.
-
-| Model | E_before | E_after | ΔE (after − before) |
-|-------|----------|---------|----------------------|
-| B_task | 1.0 | 0.3469 | −0.6531 |
-| B_adv | 0.0204 | 0.3469 | 0.3265 |
-| B_static_inlp | 0.0204 | 0.3469 | 0.3265 |
-
-*Generated: 2026-04-03T20:53:13 — Model: Qwen/Qwen2.5-0.5B, cuda:9, seed 42. Bios train=96, val=24, test=32. λ1 (CLI)=0.45 (B_adv/Main train), λ2 (Main)=0.04, INLP k=1.*
-
-#### TABLE 1 — Biography (Claim 1: suppression on training distribution)
-
-| Model | R_bio | E_bio (↓ better) | Notes |
-|-------|-------|------------------|-------|
-| B_task | 1.0 | 1.0 | High bias (reference) |
-| B_adv | 0.5714 | 0.0204 | Adversarial suppression |
-| B_static_inlp | 0.5714 | 0.0204 | Static INLP |
-
-*Target:* B_adv / INLP **E_bio** clearly **<** B_task; sweet spot often **0.3 < E_bio < 0.8** (tune `--lambda-bias`, `--inlp-iterations`, or demo `--full-debias`).
-
-#### TABLE 2 — Bias return after agentic step 1 (Claim 2a)
-
-| Model | E_bio | E1 | E1 − E_bio (lift; + = return / shift) |
-|-------|-------|-----|----------------------------------------|
-| B_task | 1.0 | 0.6735 | −0.3265 |
-| B_adv | 0.0204 | 0.3469 | 0.3265 |
-| B_static_inlp | 0.0204 | 0.0204 | 0.0 |
-
-*Target:* B_adv with **E1 > E_bio** (positive lift) → bias suppressed on bios but **re-emerges** under agentic prompting + inner adaptation.
-
-#### TABLE 3 — Drift across reasoning steps (Claim 2b)
-
-| Model | E1 | E3 | ΔE = E3 − E1 |
-|-------|-----|-----|--------------|
-| B_task | 0.6735 | 0.3469 | −0.3265 |
-| B_adv | 0.3469 | 0.0204 | −0.3265 |
-| B_static_inlp | 0.0204 | 0.0204 | 0.0 |
-
-*Target (paper):* B_adv **ΔE > 0** (bias accumulates step 1 → step 3). *On this tiny split the numbers differ; see full runs under `results/`.*
-
-#### TABLE 4 — Main vs B_adv (Claim 3)
-
-| Model | E_bio | E1 | E3 | ΔE (E3−E1) |
-|-------|-------|-----|-----|------------|
-| B_adv | 0.0204 | 0.3469 | 0.0204 | −0.3265 |
-| Main | 0.0 | 0.0204 | 0.0204 | 0.0 |
-
-#### TABLE 5 — Task utility (final agentic step occupation accuracy %)
-
-| Model | Final step occ. acc % |
-|-------|------------------------|
-| B_task | 25.0 |
-| B_adv | 34.375 |
-| B_static_inlp | 9.375 |
-| A2_runtime_dynamic_proj | 18.75 |
-| Main | 40.625 |
-
-#### Full metric dump (all baselines — demo)
-
-| Baseline | Final Occ Acc % | R1 | R2 | R3 | ΔR | E1 | E2 | E3 | ΔE |
-|----------|-----------------|-----|-----|-----|-----|-----|-----|-----|-----|
-| B_task | 25.0 | 0.8571 | 0.7143 | 0.7143 | −0.1429 | 0.6735 | 0.3469 | 0.3469 | −0.3265 |
-| A2_runtime_dynamic_proj | 18.75 | 0.7143 | 0.7143 | 0.5714 | −0.1429 | 0.3469 | 0.3469 | 0.0204 | −0.3265 |
-| B_adv | 34.375 | 0.7143 | 0.5714 | 0.5714 | −0.1429 | 0.3469 | 0.0204 | 0.0204 | −0.3265 |
-| B_static_inlp | 9.375 | 0.5714 | 0.5714 | 0.5714 | 0.0 | 0.0204 | 0.0204 | 0.0204 | 0.0 |
-| Main | 40.625 | 0.5714 | 0.5714 | 0.5714 | 0.0 | 0.0204 | 0.0204 | 0.0204 | 0.0 |
-
-*R1/R2/R3: raw probe accuracy; E1/E2/E3: excess recoverability; ΔE = E3−E1. Inner adaptation: B_task → L_task on task head; B_adv/Main (LoRA) → L_task on LoRA+task head by default.*
-
-#### Supporting: full biography + lift (demo)
-
-| Baseline | R_bio | E_bio | ROC-AUC | E1−E_bio |
-|----------|-------|-------|---------|----------|
-| B_task | 1.0 | 1.0 | 1.0 | −0.3265 |
-| A2_runtime_dynamic_proj | 1.0 | 1.0 | 1.0 | −0.6531 |
-| B_adv | 0.5714 | 0.0204 | 0.6667 | 0.3265 |
-| B_static_inlp | 0.5714 | 0.0204 | 0.8333 | 0.0 |
-| Main | 0.4286 | 0.0 | 0.6667 | 0.0204 |
+| Model | E_bio | Final occ. acc % |
+|-------|-------|------------------|
+| B_task | 1.0 | 25.0 |
+| B_adv | 0.0204 | 34.375 |
+| B_static_inlp | 0.0204 | 9.375 |
+| Main | 0.0 | 40.625 |
 
 ---
 
@@ -252,7 +174,7 @@ Same tokenized biographies: extra task loss on the **train** split (**bias head 
 - **Part 1 — Data:** `data/bias_in_bios.py`, `data/loaders.py`; stats script above.  
 - **Part 2 — Protocol:** `EVALUATION_PROTOCOL.md`.  
 - **Part 3 — Models / baselines:** `models/`, `baselines/`.  
-- **Part 4 — Results:** `results/baseline_comparison.json`, `results/agentic_report_*.md`, **`demo/output/demo_agentic_report.md`**.
+- **Part 4 — Results:** `results/baseline_comparison.json`, **`results/agentic_report_20260403_122754.md`**, `demo/output/demo_agentic_report.md`.
 
 ---
 

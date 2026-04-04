@@ -1,0 +1,40 @@
+{
+  "description": "Baseline comparison from run 2026-02-21. R(θ) = probe accuracy on sensitive attribute; ΔR = change in R(θ) after LoRA adaptation.",
+  "generated": "2026-02-21T22:12:18.248015",
+  "model": "Qwen/Qwen2.5-0.5B",
+  "device": "cuda:9",
+  "data": {
+    "controlled_train": 1600,
+    "controlled_eval": 400,
+    "crows_pairs": 1508,
+    "bbq": 1840
+  },
+  "baselines": {
+    "B1_standard": {
+      "name": "No suppression (standard fine-tuning)",
+      "task_accuracy_percent": 100.0,
+      "R_theta": 0.4875,
+      "crows_pairs_bias_percent": 51.33,
+      "bbq_accuracy_percent": 29.4,
+      "bbq_gap_percent": 0.0
+    },
+    "B2_adversarial": {
+      "name": "Adversarial debiasing (GRL)",
+      "task_accuracy_percent": 100.0,
+      "R_theta": 0.5312,
+      "crows_pairs_bias_percent": 50.07,
+      "bbq_accuracy_percent": 25.43,
+      "bbq_gap_percent": 0.0
+    },
+    "B3_INLP": {
+      "name": "INLP (iterative nullspace projection)",
+      "task_accuracy_percent": 75.0,
+      "R_theta": 0.4938,
+      "crows_pairs_bias_percent": 51.92,
+      "bbq_accuracy_percent": 28.91,
+      "bbq_gap_percent": 0.0
+    }
+  },
+  "lora_delta_R": 0.0344,
+  "summary": "B1/B2 reach 100% task accuracy; B3 INLP drops to 75%. R(θ) ~49–53% (near chance). CrowS-Pairs bias ~50–52%; BBQ gap 0. LoRA ΔR = +0.0344."
+}
