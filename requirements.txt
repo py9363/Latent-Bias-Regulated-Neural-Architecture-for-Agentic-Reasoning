@@ -1,0 +1,15 @@
+# Core
+torch>=2.0.0
+transformers>=4.40.0
+datasets>=2.14.0
+accelerate>=0.25.0
+
+# PEFT for LoRA
+peft>=0.10.0
+
+# Evaluation
+scikit-learn>=1.3.0
+numpy>=1.24.0
+
+# Optional
+tqdm>=4.65.0

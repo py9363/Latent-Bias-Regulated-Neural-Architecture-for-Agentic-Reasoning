@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+.env
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model checkpoints & large artifacts (regenerate with training scripts)
+checkpoints/
+representations/
+*.pt
+*.bin
+*.safetensors
+
+# Optional: local demo logs (README documents how to regenerate)
+demo/output/

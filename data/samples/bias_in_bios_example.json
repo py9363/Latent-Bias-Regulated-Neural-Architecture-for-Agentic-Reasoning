@@ -1,0 +1,23 @@
+{
+  "description": "Illustrative schema for Bias in Bios-style rows (synthetic text; not from the real dataset). Real data: Hugging Face LabHC/bias_in_bios.",
+  "fields": {
+    "hard_text": "Biography paragraph (model input).",
+    "occupation": "String occupation name (dataset-specific vocabulary).",
+    "gender": "Binary or categorical sensitive attribute used for linear probing (encoding depends on loader).",
+    "occupation_id": "Integer 0-27 aligned with NUM_OCCUPATIONS in code."
+  },
+  "examples": [
+    {
+      "hard_text": "Dr. Jane Example received a Ph.D. in computer science and works as a professor.",
+      "occupation": "professor",
+      "gender": "F",
+      "occupation_id": 0
+    },
+    {
+      "hard_text": "John Example trained as an electrician and runs a small contracting business.",
+      "occupation": "electrician",
+      "gender": "M",
+      "occupation_id": 1
+    }
+  ]
+}
