@@ -61,7 +61,7 @@ flowchart TB
 | `main.py` | Single-baseline Bios runner + CrowS/BBQ + optional LoRA ΔR |
 | `run_all_baselines.py` | Full Bios B1–B3 (+ Main optional paths per script), aggregate report |
 | `run_agentic_baselines.py` | Agentic evaluation + TABLE 0–5 reports (edit `CONFIG` in `main()`) |
-| `results/` | Example **JSON/MD** reports from past runs (regenerate on your machine) |
+| `results/` | Reports (**JSON/MD**), **`figures/`** (dataset distributions, e.g. gender / occupation PNGs) |
 | `EVALUATION_PROTOCOL.md` | Detailed evaluation steps (static + agentic) |
 
 ---
@@ -94,6 +94,31 @@ No manual download is required for standard runs: the loaders fetch splits on fi
 
 ```bash
 python scripts/run_bias_in_bios_stats.py
+```
+
+### Dataset distributions (figures)
+
+Committed plots under **`results/figures/`** (Bias in Bios, predefined splits; counts depend on caps when the script ran).
+
+**Gender (train)** — `results/figures/gender_distribution.png`
+
+<p align="center">
+  <img src="./results/figures/gender_distribution.png" alt="Bias in Bios: gender distribution on train split" width="520" />
+</p>
+
+**Occupation (train, 28 classes)** — `results/figures/occupation_distribution.png`
+
+<p align="center">
+  <img src="./results/figures/occupation_distribution.png" alt="Bias in Bios: occupation counts on train split" width="720" />
+</p>
+
+*If images do not show in the editor preview, open the PNG paths above in the file tree, or view the README on GitHub after pushing (remote rendering resolves the same paths).*
+
+**Regenerate plots** (default output names: `bias_in_bios_split_sizes.png`, `bias_in_bios_gender_train.png`, `bias_in_bios_occupation_train.png` in `results/figures/`):
+
+```bash
+python scripts/plot_bias_in_bios_data.py
+python scripts/plot_bias_in_bios_data.py --out results/figures --bios-train-max 10000
 ```
 
 ---
