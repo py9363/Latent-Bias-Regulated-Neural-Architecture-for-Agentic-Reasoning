@@ -1,0 +1,74 @@
+========================================================================
+Bias in Bios — FULL BASELINE DEMO (B0, B1, B2, B3, Main)
+UTC: 2026-04-04T00:31:01.629096+00:00
+========================================================================
+Using device: cuda:9
+  CUDA: gpu_index=9 | visible_count=32 | NVIDIA A16
+
+Demo split: train=96 val=24 test=32
+epochs=5 batch_size=4 model=Qwen/Qwen2.5-0.5B
+INLP: using k=1 (capped from --inlp-k=3 for n_train=96). Use --full-debias to force requested k.
+Debias (demo-friendly): lambda_bias=0.45 lambda_stab=0.04 main_inner_steps=4 | --full-debias for paper-style weights.
+Wrote sample batch preview → /home/stu5/s18/py9363/PoojaYakkala_Capstone/demo/data/sample_batch.json
+
+--- B0: Pretrained Qwen (no fine-tuning) ---
+  occ_acc=9.375%  R=0.9583
+
+--- B1: Standard fine-tuning ---
+B1 Epoch 1/5 loss: 3.5314
+B1 Epoch 2/5 loss: 0.9298
+B1 Epoch 3/5 loss: 0.3137
+B1 Epoch 4/5 loss: 0.0871
+B1 Epoch 5/5 loss: 0.0508
+Checkpoint saved to /home/stu5/s18/py9363/PoojaYakkala_Capstone/demo/output/checkpoints/b1_demo/pytorch_model.pt
+  occ_acc=62.5%  R=0.8333
+
+--- B2: Adversarial debiasing (LoRA) ---
+B2 LoRA: r=64 alpha=128 (base backbone frozen; adapters + heads train) | bias_head=MLP | bias_loss_balance=True
+B2 Epoch 1/5  loss_avg=10.2507  L_task_avg=8.7294  L_bias_avg=0.8452  (λ1·L_bias)_term_avg=1.5213  ratio_L_task/L_bias=10.33
+B2 Epoch 2/5  loss_avg=5.5496  L_task_avg=4.3395  L_bias_avg=0.6965  (λ1·L_bias)_term_avg=1.2100  ratio_L_task/L_bias=6.23
+B2 Epoch 3/5  loss_avg=3.4012  L_task_avg=2.5020  L_bias_avg=0.6211  (λ1·L_bias)_term_avg=0.8992  ratio_L_task/L_bias=4.03
+B2 Epoch 4/5  loss_avg=2.5196  L_task_avg=1.8308  L_bias_avg=0.5644  (λ1·L_bias)_term_avg=0.6888  ratio_L_task/L_bias=3.24
+B2 Epoch 5/5  loss_avg=1.9489  L_task_avg=1.3599  L_bias_avg=0.5461  (λ1·L_bias)_term_avg=0.5890  ratio_L_task/L_bias=2.49
+B2 checkpoint saved to /home/stu5/s18/py9363/PoojaYakkala_Capstone/demo/output/checkpoints/b2_demo/pytorch_model.pt
+  occ_acc=56.25%  R=0.7917
+
+--- B3: INLP (k=1) ---
+B3 Epoch 1/5 loss: 9.9729
+B3 Epoch 2/5 loss: 9.0138
+B3 Epoch 3/5 loss: 8.0970
+B3 Epoch 4/5 loss: 7.2214
+B3 Epoch 5/5 loss: 6.4017
+  occ_acc=0.0%  R=0.7917
+
+--- Main: Stability-regularized adversarial (LoRA) ---
+Main (LoRA): r=64 alpha=128 | λ1=0.45 λ2=0.04 inner_lr=0.0001 steps=4 stab=kl | bias_loss_balance=True
+Main: inner (simulated) adaptation runs on CPU to avoid 2× GPU memory.
+Main Epoch 1/5  loss_avg=7.4689  L_task_avg=6.0244  L_bias_avg=0.8191  (λ1·L_bias)_term_avg=1.4445  ratio_L_task/L_bias=7.36
+Main Epoch 2/5  loss_avg=4.6561  L_task_avg=3.6544  L_bias_avg=0.6529  (λ1·L_bias)_term_avg=1.0016  ratio_L_task/L_bias=5.60
+Main Epoch 3/5  loss_avg=3.3226  L_task_avg=2.4619  L_bias_avg=0.5939  (λ1·L_bias)_term_avg=0.8606  ratio_L_task/L_bias=4.15
+Main Epoch 4/5  loss_avg=2.3402  L_task_avg=1.6908  L_bias_avg=0.6090  (λ1·L_bias)_term_avg=0.6493  ratio_L_task/L_bias=2.78
+Main Epoch 5/5  loss_avg=1.6576  L_task_avg=1.1460  L_bias_avg=0.6879  (λ1·L_bias)_term_avg=0.5115  ratio_L_task/L_bias=1.67
+Main checkpoint saved to /home/stu5/s18/py9363/PoojaYakkala_Capstone/demo/output/checkpoints/main_demo/pytorch_model.pt
+  occ_acc=68.75%  R=0.7917
+
+--- Agentic evaluation (TABLE 0–5; test split, multi-step prompts) ---
+Wrote agentic Markdown → /home/stu5/s18/py9363/PoojaYakkala_Capstone/demo/output/demo_agentic_report.md
+Wrote agentic JSON    → /home/stu5/s18/py9363/PoojaYakkala_Capstone/demo/output/demo_agentic_report.json
+
+========================================================================
+SUMMARY (Bias in Bios demo split)
+========================================================================
+Model               Occ acc %  Gender gap   R_probe  R_chance
+------------------------------------------------------------------------
+B0_pretrained            9.38       16.67    0.9583    0.5083
+B1_standard             62.50       22.22    0.8333    0.5083
+B2_adversarial          56.25       11.11    0.7917    0.5083
+B3_INLP                  0.00        0.00    0.7917    0.5083
+Main                    68.75        7.94    0.7917    0.5083
+========================================================================
+
+Wrote JSON report → /home/stu5/s18/py9363/PoojaYakkala_Capstone/demo/output/demo_full_report.json
+Agentic report (TABLE 0–5) → /home/stu5/s18/py9363/PoojaYakkala_Capstone/demo/output/demo_agentic_report.md
+Full log → /home/stu5/s18/py9363/PoojaYakkala_Capstone/demo/output/demo_log.txt
+Done.

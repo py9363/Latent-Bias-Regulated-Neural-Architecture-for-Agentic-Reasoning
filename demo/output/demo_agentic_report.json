@@ -1,0 +1,69 @@
+{
+  "meta": {
+    "timestamp": "2026-04-05T20:34:47.519627",
+    "report_kind": "demo",
+    "device": "cuda:9",
+    "model": "Qwen/Qwen2.5-0.5B",
+    "seed": 42,
+    "bios_train": 1000,
+    "bios_val": 250,
+    "bios_test": 500,
+    "epochs": 5,
+    "batch_size": 16,
+    "max_length": 256,
+    "lambda_bias": 0.45,
+    "lambda_bias_train_used": 0.45,
+    "lambda_stab": 0.04,
+    "inlp_iterations": 3,
+    "inlp_iterations_used": 3,
+    "main_inner_steps_used": 4,
+    "full_debias": false,
+    "skip_main_training": false,
+    "skip_table0": false,
+    "bio_ft_epochs": 3,
+    "bio_ft_lr": 5e-05,
+    "adaptation_steps": 5,
+    "adaptation_lr": 0.0001,
+    "adapt_objective": "summarize_lm",
+    "adapt_lm_max_length": 256,
+    "adapt_lm_micro_batch": 4,
+    "probe_protocol": "Same sklearn Pipeline(StandardScaler, LogisticRegression) and random_state=seed for R1/R2/R3; 80/20 stratified probe split; scaler fit on probe train only.",
+    "baselines_run": [
+      "B_adv"
+    ],
+    "agentic_models": "b_adv"
+  },
+  "results": {
+    "B_adv": {
+      "probe_chance_baseline": 0.552,
+      "step1_recoverability_R1": 0.9,
+      "step2_recoverability_R2": 0.91,
+      "step3_recoverability_R3": 0.91,
+      "step1_excess_recoverability_E1": 0.7768,
+      "step2_excess_recoverability_E2": 0.7991,
+      "step3_excess_recoverability_E3": 0.7991,
+      "trajectory_delta_R": 0.01,
+      "trajectory_delta_excess_R": 0.0223,
+      "step1_probe_roc_auc": 0.9547,
+      "step2_probe_roc_auc": 0.9741,
+      "step3_probe_roc_auc": 0.9766,
+      "final_step_occupation_accuracy": 46.0,
+      "adapt_objective": "summarize_lm",
+      "biography_probe_R": 0.95,
+      "biography_probe_chance": 0.552,
+      "biography_probe_E": 0.8884,
+      "biography_probe_roc_auc": 0.9863,
+      "agentic_E1_minus_biography_E": -0.1116
+    }
+  },
+  "table0_pure_bio_task_ft": {
+    "B_adv": {
+      "E_bio_before_ft": 0.8884,
+      "E_bio_after_bio_ft": 0.6652,
+      "delta_E_bio_pure_ft": -0.2232,
+      "R_bio_before_ft": 0.95,
+      "R_bio_after_bio_ft": 0.85,
+      "adapt_objective": "summarize_lm"
+    }
+  }
+}

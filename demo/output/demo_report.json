@@ -1,0 +1,17 @@
+{
+  "timestamp_utc": "2026-04-03T22:51:27.775204+00:00",
+  "model": "Qwen/Qwen2.5-0.5B",
+  "device": "cuda:9",
+  "train_n": 64,
+  "test_n": 32,
+  "batch_size": 8,
+  "epochs": 1,
+  "probe_only": false,
+  "occupation_acc_test_before": 9.375,
+  "occupation_acc_test_after": 28.125,
+  "probe_R_before": 0.875,
+  "probe_R_after": 0.875,
+  "probe_chance": 0.5625,
+  "sample_preview_path": "/home/stu5/s18/py9363/PoojaYakkala_Capstone/demo/data/sample_batch.json",
+  "log_path": "/home/stu5/s18/py9363/PoojaYakkala_Capstone/demo/output/demo_log.txt"
+}
