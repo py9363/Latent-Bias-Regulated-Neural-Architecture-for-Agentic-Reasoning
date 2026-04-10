@@ -7,7 +7,10 @@ L_stab penalizes drift in bias-head logits after a *simulated* task-only adaptat
 deep-copied model (LoRA + task head updated; bias head frozen). Gradients flow through the main
 model via s_pred; s_pred_tilde is detached (no backprop through the copy).
 
-(Formerly named “B4 stability” in earlier drafts; the trained baseline is **Main** in `run_main`.)
+Model definition: ``QwenAdversarialModel`` in ``models/adversarial.py`` (shared Qwen backbone +
+task head + GRL bias head).
+Forward contract: ``out = model(...)`` returns a dict with
+``logits``, ``bias_logits``, optional ``loss_task``/``loss_bias``, and pooled ``hidden_states``.
 """
 from __future__ import annotations
 
@@ -34,6 +37,9 @@ from config import (
     DEFAULT_LR,
     DEFAULT_LAMBDA_BIAS,
     DEFAULT_LAMBDA_STAB,
+    DEFAULT_LORA_ALPHA,
+    DEFAULT_LORA_DROPOUT,
+    DEFAULT_LORA_R,
     ensure_dirs,
     get_device,
 )
@@ -46,14 +52,24 @@ MAIN_LOGIT_CLAMP = 35.0
 MAIN_GRAD_CLIP_NORM = 1.0
 
 
-def _inner_loop_params(model: QwenAdversarialModel) -> List[torch.nn.Parameter]:
-    """Trainable params for simulated adaptation: everything trainable except bias_head."""
-    return [p for n, p in model.named_parameters() if p.requires_grad and "bias_head" not in n]
-
-
-def _set_bias_head_trainable(model: QwenAdversarialModel, trainable: bool) -> None:
-    for p in model.bias_head.parameters():
-        p.requires_grad = trainable
+def _inner_sgd_params(model_inner: QwenAdversarialModel, model: QwenAdversarialModel) -> List[torch.nn.Parameter]:
+    """
+    Freeze all of ``model_inner`` (no .grad buffers on frozen weights), then enable grad only on
+    parameters that are trainable on ``model`` except ``bias_head`` (inner loop is task-only).
+    """
+    for p in model_inner.parameters():
+        p.requires_grad = False
+    for (nm, pm), (ni, pi) in zip(model.named_parameters(), model_inner.named_parameters()):
+        if nm != ni:
+            raise RuntimeError(f"model / model_inner param name mismatch: {nm!r} vs {ni!r}")
+        if "bias_head" in nm:
+            continue
+        if pm.requires_grad:
+            pi.requires_grad = True
+    inner = [p for p in model_inner.parameters() if p.requires_grad]
+    if not inner:
+        raise RuntimeError("Main inner loop has no trainable parameters (check LoRA / task head).")
+    return inner
 
 
 def stability_loss(
@@ -84,9 +100,9 @@ def stability_loss(
 
 def run_main(
     train_dataset: Dataset,
-    eval_dataset: Optional[Dataset] = None,
+    eval_dataset: Optional[Dataset] = None,  # reserved / unused (API parity with other baselines)
     model_name: str = "Qwen/Qwen2.5-0.5B",
-    num_labels: int = 2,
+    num_labels: int = 28,
     num_bias_labels: int = 2,
     lambda_bias: float = DEFAULT_LAMBDA_BIAS,
     lambda_stab: float = DEFAULT_LAMBDA_STAB,
@@ -98,11 +114,12 @@ def run_main(
     epochs: int = DEFAULT_EPOCHS,
     lr: float = DEFAULT_LR,
     device: Optional[str] = None,
-    save_representations: bool = True,
+    save_representations: bool = False,
+    use_gradient_checkpointing: bool = True,
     use_lora: bool = True,
-    lora_r: int = 8,
-    lora_alpha: int = 32,
-    lora_dropout: float = 0.05,
+    lora_r: int = DEFAULT_LORA_R,
+    lora_alpha: int = DEFAULT_LORA_ALPHA,
+    lora_dropout: float = DEFAULT_LORA_DROPOUT,
     grad_clip_norm: float = MAIN_GRAD_CLIP_NORM,
     balance_bias_loss: bool = DEFAULT_ADV_BIAS_LOSS_BALANCE,
 ) -> tuple:
@@ -111,10 +128,16 @@ def run_main(
 
     Per batch:
       1) Forward main model → L_task, L_bias, bias logits (before).
-      2) Sync a **CPU** twin from current weights; inner SGD on L_task only (LoRA + task head; bias head frozen).
-         (Avoids ``deepcopy`` on GPU, which doubles VRAM and commonly OOMs.)
+      2) Sync a **GPU** twin from current weights when training on CUDA. All twin weights are frozen
+         for autograd except the same subset the outer model trains excluding ``bias_head``, so the twin
+         holds **weights only** on frozen modules (no grad tensors there). On CPU-only runs, twin stays on CPU.
       3) Forward copy → bias logits (after); L_stab = MSE or KL between before/after.
       4) L = L_task + λ1 L_bias + λ2 L_stab; backward on main model only.
+
+    ``save_representations``: if False (default), skips saving train-set hidden states (saves RAM).
+
+    ``use_gradient_checkpointing``: if True (default), enables HF gradient checkpointing on the backbone
+    (lower activation VRAM, somewhat slower steps).
 
     Returns (model, checkpoint_path, representations_path or None).
     """
@@ -152,18 +175,19 @@ def run_main(
 
     model = model.to(device)
     dev = torch.device(device)
+    if use_gradient_checkpointing and hasattr(model.backbone, "gradient_checkpointing_enable"):
+        model.backbone.gradient_checkpointing_enable()
+        print("Main: gradient checkpointing enabled on backbone (lower activation memory).")
+
     trainable_main = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_main, lr=lr)
 
-    # One CPU copy for simulated adaptation. Per-batch deepcopy on CUDA would allocate a second full model on GPU → OOM.
     if dev.type == "cuda":
-        model.cpu()
-        model_inner_cpu = copy.deepcopy(model)
-        model.to(dev)
+        model_inner = copy.deepcopy(model).to(dev)
         torch.cuda.empty_cache()
-        print("Main: inner (simulated) adaptation runs on CPU to avoid 2× GPU memory.")
+        print("Main: inner (simulated) adaptation runs on GPU (twin model in VRAM).")
     else:
-        model_inner_cpu = copy.deepcopy(model)
+        model_inner = copy.deepcopy(model)
 
     pin_memory = device.startswith("cuda") if isinstance(device, str) else False
     train_loader = DataLoader(
@@ -193,25 +217,27 @@ def run_main(
             l_task = out["loss_task"]
             l_bias = out["loss_bias"]
             s_pred = out["bias_logits"]
+            del out
 
-            sd_cpu = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            model_inner_cpu.load_state_dict(sd_cpu, strict=True)
-            model_inner_cpu.train()
-            _set_bias_head_trainable(model_inner_cpu, False)
-
-            inner_params = _inner_loop_params(model_inner_cpu)
-            if not inner_params:
-                raise RuntimeError("Main inner loop has no trainable parameters (check LoRA / task head).")
+            # load_state_dict copies into model_inner's parameters — no extra full state_dict clone dict
+            model_inner.load_state_dict(model.state_dict(), strict=True)
+            model_inner.train()
+            inner_params = _inner_sgd_params(model_inner, model)
             inner_opt = torch.optim.SGD(inner_params, lr=inner_lr, momentum=0.0)
 
-            ids_c = inputs["input_ids"].cpu()
-            mask_c = inputs["attention_mask"].cpu()
-            labels_c = inputs["labels"].cpu()
+            if dev.type == "cuda":
+                ids_c = inputs["input_ids"]
+                mask_c = inputs["attention_mask"]
+                labels_c = inputs["labels"]
+            else:
+                ids_c = inputs["input_ids"].cpu()
+                mask_c = inputs["attention_mask"].cpu()
+                labels_c = inputs["labels"].cpu()
 
             with torch.enable_grad():
                 for _ in range(inner_steps):
                     inner_opt.zero_grad()
-                    inner_out = model_inner_cpu(
+                    inner_out = model_inner(
                         input_ids=ids_c,
                         attention_mask=mask_c,
                         labels=labels_c,
@@ -223,9 +249,9 @@ def run_main(
                     torch.nn.utils.clip_grad_norm_(inner_params, max_norm=grad_clip_norm)
                     inner_opt.step()
 
-            model_inner_cpu.eval()
+            model_inner.eval()
             with torch.no_grad():
-                after_out = model_inner_cpu(
+                after_out = model_inner(
                     input_ids=ids_c,
                     attention_mask=mask_c,
                 )
@@ -249,7 +275,6 @@ def run_main(
             sum_task += float(l_task.detach().item())
             sum_bias += float(l_bias.detach().item())
             sum_bterm += float(b_term.detach().item())
-            del sd_cpu
             gc.collect()
 
         mt = sum_task / n_batches
@@ -262,7 +287,7 @@ def run_main(
             f"ratio_L_task/L_bias={ratio:.2f}"
         )
 
-    del model_inner_cpu
+    del model_inner
     gc.collect()
     if dev.type == "cuda":
         torch.cuda.empty_cache()
@@ -286,6 +311,8 @@ def run_main(
                 "lora_dropout": lora_dropout if use_lora else None,
                 "baseline": "main_stability",
                 "balance_bias_loss": balance_bias_loss,
+                "inner_adapt_on_gpu": dev.type == "cuda",
+                "gradient_checkpointing": bool(use_gradient_checkpointing),
             },
         },
         ckpt_path,

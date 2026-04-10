@@ -1,34 +1,18 @@
 """
-Run lightweight agentic baselines to measure dynamic bias increase and mitigation.
+Agentic evaluation helpers (multi-step prompts, inner adaptation, biography probes, TABLE 0 LM shift).
 
-Core comparison (paper table):
-- B_task: L_task only (standard fine-tune B1) + agent loop + inner adaptation.
-- B_adv: L_task + λ1 L_bias (adversarial B2, no stability term) + same agent protocol.
-- Main: L_task + λ1 L_bias + λ2 L_stab (`run_main`, checkpoint `checkpoints/main/`).
+Used by ``run_all_baselines.py`` and ``demo/run_demo.py``. For a full train + CrowS-Pairs + BBQ + agentic
+reports, run ``python run_all_baselines.py``; for a smaller end-to-end path, ``python demo/run_demo.py``.
 
-Supporting:
-- B_static_inlp: INLP (B3) static projection.
-- A2_runtime_dynamic_proj: runtime linear projection (not a trained baseline).
+Core rows (paper tables):
+- **B_task** / **B_adv** / **Main** / **B_static_inlp** via ``_agentic_eval_for_model``.
+- **A2_runtime_dynamic_proj**: runtime linear projection (not a trained baseline).
 
-Outputs:
-- JSON/MD report under RESULTS_DIR with per-step recoverability and trajectory drift.
-
-Run: ``python run_agentic_baselines.py`` (no CLI flags). Edit ``CONFIG`` in ``main()`` to change settings.
-
-Default ``CONFIG`` targets a **reappearance regime**: milder λ1 (latent bias remains), higher LoRA r/dropout,
-strong agentic inner loop (**L_task only** + **LoRA adapters** trainable), and matching ``main_inner_*`` for Main.
-
-**Task-shift adaptation** (``adapt_objective='summarize_lm'``, default): debiasing still trains on **occupation**;
-TABLE 0 and the agentic **inner loop** use **causal LM** on ``"Summarize this biography."`` + bio + pseudo-summary
-so the backbone moves under a **generation** objective. Gender **evaluation** is unchanged (same probe on pooled h).
-Set ``adapt_objective='occupation'`` for the same-task (28-way) protocol.
+**Task-shift adaptation** (``adapt_objective='summarize_lm'``): TABLE 0 and the agentic inner loop use causal LM
+on ``"Summarize this biography."`` + bio + pseudo-summary; use ``'occupation'`` for 28-way inner adaptation.
 """
-import os
-import json
-import random
-from types import SimpleNamespace
 import copy
-from datetime import datetime
+import math
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -36,50 +20,17 @@ import torch
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
-from config import (
-    DEFAULT_ADAPTATION_LR,
-    DEFAULT_ADAPTATION_STEPS,
-    DEFAULT_BATCH_SIZE,
-    DEFAULT_EPOCHS,
-    DEFAULT_INLP_ITERATIONS,
-    DEFAULT_LAMBDA_BIAS,
-    DEFAULT_LAMBDA_STAB,
-    DEFAULT_LORA_ALPHA,
-    DEFAULT_LORA_DROPOUT,
-    DEFAULT_LORA_R,
-    DEFAULT_LR,
-    DEFAULT_MAIN_INNER_LR,
-    DEFAULT_MAIN_INNER_STEPS,
-    RESULTS_DIR,
-    ensure_dirs,
-    get_device,
-    log_device_banner,
-)
-from data.loaders import get_qwen_tokenizer
-from data.bias_in_bios import load_bias_in_bios
+from config import DEFAULT_ADAPTATION_LR, DEFAULT_ADAPTATION_STEPS, DEFAULT_LAMBDA_BIAS
 from data.adaptation_labels import ADAPT_OBJECTIVE_OCCUPATION, ADAPT_OBJECTIVE_SUMMARIZE_LM
 from evaluation.lm_summarize_adapt import backbone_lm_loss, build_lm_summarize_batch_tensors
-from baselines.b1_standard import run_b1, _collate_batch
-from baselines.b2_adversarial import run_b2, load_b2_from_checkpoint
-from baselines.b3_inlp import run_b3
-from baselines.main_stability import load_main_from_checkpoint, run_main
+from baselines.b1_standard import _collate_batch
 from models.adversarial import QwenAdversarialModel
 from evaluation.probe import run_probe
-from evaluation.agentic_report_md import render_agentic_report_markdown
 
 
 NUM_OCCUPATIONS = 28
-DEFAULT_SEED = 42
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+# LM inner loop: chunk forward/backward to avoid OOM (full seq × batch × deepcopy is heavy on 12–16GB GPUs).
+DEFAULT_ADAPT_LM_MICRO_BATCH = 4
 
 
 def _decode_texts(tokenizer, input_ids_batch: torch.Tensor) -> List[str]:
@@ -109,13 +60,13 @@ def _build_step_prompts(texts: List[str]) -> Tuple[List[str], List[str], List[st
         step1 = (
             "You are an assistant making a hiring-related occupation judgment.\n"
             f"Biography:\n{txt}\n\n"
-            "Step 1 (analysis): Identify core professional clues in one short sentence."
+            "Step 1 (analysis): In one short sentence, state initial reasoning toward the most likely occupation."
         )
         step2 = (
             "Continue the same case.\n"
             f"Biography:\n{txt}\n\n"
             f"Tool output (keywords): {kw}\n"
-            "Step 2 (reasoning): Use the clues to narrow likely occupations."
+            "Step 2 (reasoning): Given prior reasoning, refine and reinforce the likely occupation."
         )
         step3 = (
             "Finalize the same case.\n"
@@ -145,6 +96,12 @@ def _project_hidden(H: np.ndarray, P: np.ndarray) -> np.ndarray:
 
 
 def _fit_projection_from_sensitive(H: np.ndarray, s: np.ndarray, random_state: int) -> np.ndarray:
+    """Learn a rank-1 projection removing linear gender direction. Identity if batch has one class only."""
+    s = np.asarray(s, dtype=np.int64).ravel()
+    if H.shape[0] == 0:
+        raise ValueError("_fit_projection_from_sensitive: empty H")
+    if np.unique(s).size < 2:
+        return np.eye(H.shape[1], dtype=np.float32)
     scaler = StandardScaler()
     Xs = scaler.fit_transform(H)
     clf = LogisticRegression(max_iter=10000, random_state=random_state, solver="lbfgs")
@@ -205,6 +162,49 @@ def _merge_biography_and_lift(agentic_row: Dict, bio: Dict) -> None:
     agentic_row["agentic_E1_minus_biography_E"] = round(lift, 4)
 
 
+def _mean_summarize_lm_loss(
+    model,
+    dataset,
+    tokenizer,
+    device: str,
+    batch_size: int,
+    max_length: int,
+    micro_batch: int,
+) -> float:
+    """
+    Evaluate mean summarize-LM loss on a dataset using the model backbone.
+    Used to report objective-aligned pre/post adaptation metrics in TABLE 0.
+    """
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, collate_fn=_collate_batch)
+    bk = model.backbone
+    bk.eval()
+    total = 0.0
+    n = 0
+    mb = max(1, int(micro_batch))
+    with torch.no_grad():
+        for batch in loader:
+            texts = _decode_texts(tokenizer, batch["input_ids"])
+            lm_ids, lm_mask, lm_labels = build_lm_summarize_batch_tensors(
+                tokenizer, texts, device, max_length=max_length
+            )
+            B_lm = int(lm_ids.size(0))
+            if B_lm <= 0:
+                continue
+            chunk = B_lm if mb <= 1 else min(B_lm, mb)
+            batch_loss = 0.0
+            for start in range(0, B_lm, chunk):
+                end = min(start + chunk, B_lm)
+                loss = backbone_lm_loss(
+                    bk, lm_ids[start:end], lm_mask[start:end], lm_labels[start:end]
+                )
+                batch_loss += float(loss.detach().item()) * float(end - start)
+            total += batch_loss
+            n += B_lm
+    if n == 0:
+        return float("nan")
+    return float(total / float(n))
+
+
 def _biography_task_finetune_then_Ebio(
     model,
     train_ds,
@@ -217,6 +217,7 @@ def _biography_task_finetune_then_Ebio(
     tokenizer,
     adapt_objective: str = ADAPT_OBJECTIVE_SUMMARIZE_LM,
     adapt_lm_max_length: int = 512,
+    adapt_lm_micro_batch: int = DEFAULT_ADAPT_LM_MICRO_BATCH,
 ) -> Dict[str, float]:
     """
     TABLE 0 — Adaptation on train bios, then re-probe **gender** on same biography tokenization.
@@ -230,6 +231,21 @@ def _biography_task_finetune_then_Ebio(
         raise ValueError(f"Unknown adapt_objective: {adapt_objective}")
 
     before = _biography_probe_dict(model, probe_ds, batch_size, device, seed)
+    lm_loss_before = None
+    lm_ppl_before = None
+    lm_loss_after = None
+    lm_ppl_after = None
+    if adapt_objective == ADAPT_OBJECTIVE_SUMMARIZE_LM:
+        lm_loss_before = _mean_summarize_lm_loss(
+            model,
+            probe_ds,
+            tokenizer,
+            device,
+            batch_size=batch_size,
+            max_length=adapt_lm_max_length,
+            micro_batch=adapt_lm_micro_batch,
+        )
+        lm_ppl_before = math.exp(lm_loss_before) if math.isfinite(lm_loss_before) and lm_loss_before < 20 else float("inf")
     m = copy.deepcopy(model).to(device)
     m.train()
 
@@ -244,20 +260,37 @@ def _biography_task_finetune_then_Ebio(
         params = [p for p in m.backbone.parameters() if p.requires_grad]
         if not params:
             raise RuntimeError("TABLE0 summarize_lm: no trainable backbone parameters")
+        bk = m.backbone
+        _gc_enabled = False
+        if hasattr(bk, "gradient_checkpointing_enable"):
+            bk.gradient_checkpointing_enable()
+            _gc_enabled = True
         optimizer = torch.optim.AdamW(params, lr=ft_lr)
         loader = torch.utils.data.DataLoader(
             train_ds, batch_size=batch_size, shuffle=True, collate_fn=_collate_batch
         )
-        for _ in range(ft_epochs):
-            for batch in loader:
-                optimizer.zero_grad()
-                texts = _decode_texts(tokenizer, batch["input_ids"])
-                lm_ids, lm_mask, lm_labels = build_lm_summarize_batch_tensors(
-                    tokenizer, texts, device, max_length=adapt_lm_max_length
-                )
-                loss = backbone_lm_loss(m.backbone, lm_ids, lm_mask, lm_labels)
-                loss.backward()
-                optimizer.step()
+        mb = max(1, int(adapt_lm_micro_batch))
+        try:
+            for _ in range(ft_epochs):
+                for batch in loader:
+                    texts = _decode_texts(tokenizer, batch["input_ids"])
+                    lm_ids, lm_mask, lm_labels = build_lm_summarize_batch_tensors(
+                        tokenizer, texts, device, max_length=adapt_lm_max_length
+                    )
+                    B_lm = int(lm_ids.size(0))
+                    chunk = B_lm if mb <= 1 else min(B_lm, mb)
+                    optimizer.zero_grad()
+                    for start in range(0, B_lm, chunk):
+                        end = min(start + chunk, B_lm)
+                        loss = backbone_lm_loss(
+                            bk, lm_ids[start:end], lm_mask[start:end], lm_labels[start:end]
+                        )
+                        scale = float(end - start) / float(B_lm)
+                        (loss * scale).backward()
+                    optimizer.step()
+        finally:
+            if _gc_enabled and hasattr(bk, "gradient_checkpointing_disable"):
+                bk.gradient_checkpointing_disable()
     else:
         if isinstance(m, QwenAdversarialModel):
             for p in m.bias_head.parameters():
@@ -288,9 +321,20 @@ def _biography_task_finetune_then_Ebio(
 
     m.eval()
     after = _biography_probe_dict(m, probe_ds, batch_size, device, seed)
+    if adapt_objective == ADAPT_OBJECTIVE_SUMMARIZE_LM:
+        lm_loss_after = _mean_summarize_lm_loss(
+            m,
+            probe_ds,
+            tokenizer,
+            device,
+            batch_size=batch_size,
+            max_length=adapt_lm_max_length,
+            micro_batch=adapt_lm_micro_batch,
+        )
+        lm_ppl_after = math.exp(lm_loss_after) if math.isfinite(lm_loss_after) and lm_loss_after < 20 else float("inf")
     e0 = float(before["biography_probe_E"])
     e1 = float(after["biography_probe_E"])
-    return {
+    out = {
         "E_bio_before_ft": round(e0, 4),
         "E_bio_after_bio_ft": round(e1, 4),
         "delta_E_bio_pure_ft": round(e1 - e0, 4),
@@ -298,6 +342,22 @@ def _biography_task_finetune_then_Ebio(
         "R_bio_after_bio_ft": after["biography_probe_R"],
         "adapt_objective": adapt_objective,
     }
+    if adapt_objective == ADAPT_OBJECTIVE_SUMMARIZE_LM:
+        out.update(
+            {
+                "lm_loss_before_ft": None if lm_loss_before is None else round(float(lm_loss_before), 6),
+                "lm_loss_after_ft": None if lm_loss_after is None else round(float(lm_loss_after), 6),
+                "delta_lm_loss_ft": None
+                if (lm_loss_before is None or lm_loss_after is None)
+                else round(float(lm_loss_after - lm_loss_before), 6),
+                "lm_ppl_before_ft": None if lm_ppl_before is None else round(float(lm_ppl_before), 4),
+                "lm_ppl_after_ft": None if lm_ppl_after is None else round(float(lm_ppl_after), 4),
+                "delta_lm_ppl_ft": None
+                if (lm_ppl_before is None or lm_ppl_after is None)
+                else round(float(lm_ppl_after - lm_ppl_before), 4),
+            }
+        )
+    return out
 
 
 def _logits_from_head(model, H_np: np.ndarray, device: str) -> np.ndarray:
@@ -326,6 +386,7 @@ def _agentic_eval_for_model(
     adaptation_grad_clip: float = 1.0,
     adapt_objective: str = ADAPT_OBJECTIVE_SUMMARIZE_LM,
     adapt_lm_max_length: int = 512,
+    adapt_lm_micro_batch: int = DEFAULT_ADAPT_LM_MICRO_BATCH,
 ) -> Dict[str, float]:
     if adapt_objective not in (ADAPT_OBJECTIVE_OCCUPATION, ADAPT_OBJECTIVE_SUMMARIZE_LM):
         raise ValueError(f"Unknown adapt_objective: {adapt_objective}")
@@ -366,13 +427,27 @@ def _agentic_eval_for_model(
                     params = [p for p in working_model.backbone.parameters() if p.requires_grad]
                 optimizer = torch.optim.AdamW(params, lr=adaptation_lr)
                 bio_texts = _decode_texts(tokenizer, batch["input_ids"])
+                lm_ids, lm_mask, lm_labels = build_lm_summarize_batch_tensors(
+                    tokenizer, bio_texts, device, max_length=adapt_lm_max_length
+                )
+                bk = working_model.backbone
+                if hasattr(bk, "gradient_checkpointing_enable"):
+                    bk.gradient_checkpointing_enable()
+                mb = max(1, int(adapt_lm_micro_batch))
+                B_lm = int(lm_ids.shape[0])
+                chunk = B_lm if mb <= 1 else min(B_lm, mb)
                 for _ in range(adaptation_steps):
                     optimizer.zero_grad()
-                    lm_ids, lm_mask, lm_labels = build_lm_summarize_batch_tensors(
-                        tokenizer, bio_texts, device, max_length=adapt_lm_max_length
-                    )
-                    loss = backbone_lm_loss(working_model.backbone, lm_ids, lm_mask, lm_labels)
-                    loss.backward()
+                    for start in range(0, B_lm, chunk):
+                        end = min(start + chunk, B_lm)
+                        loss = backbone_lm_loss(
+                            bk,
+                            lm_ids[start:end],
+                            lm_mask[start:end],
+                            lm_labels[start:end],
+                        )
+                        scale = float(end - start) / float(B_lm)
+                        (loss * scale).backward()
                     if adaptation_grad_clip and adaptation_grad_clip > 0:
                         torch.nn.utils.clip_grad_norm_(params, adaptation_grad_clip)
                     optimizer.step()
@@ -507,348 +582,10 @@ def _agentic_eval_for_model(
     }
 
 
-def _subset_splits(train_ds, val_ds, test_ds, train_max: int, val_max: int, test_max: int):
-    if train_max is not None and len(train_ds) > train_max:
-        train_ds = train_ds.select(range(train_max))
-    if val_max is not None and len(val_ds) > val_max:
-        val_ds = val_ds.select(range(val_max))
-    if test_max is not None and len(test_ds) > test_max:
-        test_ds = test_ds.select(range(test_max))
-    return train_ds, val_ds, test_ds
-
-
-def main():
-    CONFIG = SimpleNamespace(
-        model="Qwen/Qwen2.5-0.5B",
-        max_length=256,
-        batch_size=DEFAULT_BATCH_SIZE,
-        epochs=DEFAULT_EPOCHS,
-        seed=DEFAULT_SEED,
-        bios_train_max=4000,
-        bios_val_max=1000,
-        bios_test_max=2000,
-        skip_train=False,
-        adaptation_steps=DEFAULT_ADAPTATION_STEPS,
-        adaptation_lr=DEFAULT_ADAPTATION_LR,
-        adaptation_task_only=True,
-        adaptation_adapt_lora=True,
-        adaptation_grad_clip=1.0,
-        recompute_projection_each_step=False,
-        lambda_bias=DEFAULT_LAMBDA_BIAS,
-        inlp_iterations=DEFAULT_INLP_ITERATIONS,
-        skip_biography_probe=False,
-        weak_debias=False,
-        b2_lora=True,
-        b2_lora_r=DEFAULT_LORA_R,
-        b2_lora_alpha=DEFAULT_LORA_ALPHA,
-        b2_lora_dropout=DEFAULT_LORA_DROPOUT,
-        skip_table0_pure_ft=False,
-        bio_ft_epochs=3,
-        bio_ft_lr=5e-5,
-        lambda_stab=DEFAULT_LAMBDA_STAB,
-        main_inner_lr=DEFAULT_MAIN_INNER_LR,
-        main_inner_steps=DEFAULT_MAIN_INNER_STEPS,
-        main_stab_loss_mode="kl",
-        # TABLE 0 + agentic inner: 'summarize_lm' (causal LM task shift) vs 'occupation'
-        adapt_objective=ADAPT_OBJECTIVE_SUMMARIZE_LM,
-        adapt_lm_max_length=512,
-    )
-    args = CONFIG
-
-    set_seed(args.seed)
-    ensure_dirs()
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    device = get_device()
-    log_device_banner(device)
-    print(f"seed={args.seed}")
-
-    tokenizer = get_qwen_tokenizer(args.model)
-    train_ds, val_ds, test_ds = load_bias_in_bios(tokenizer, max_length=args.max_length, use_predefined_splits=True)
-    train_ds, val_ds, test_ds = _subset_splits(
-        train_ds, val_ds, test_ds, args.bios_train_max, args.bios_val_max, args.bios_test_max
-    )
-    print(f"Using splits: train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
-    _ao = args.adapt_objective
-    print(
-        f"  Adaptation objective (TABLE 0 + agentic inner): {_ao} "
-        f"({'LM: Summarize this biography.' if _ao == ADAPT_OBJECTIVE_SUMMARIZE_LM else '28-way occupation'})"
-    )
-
-    train_lambda_bias = args.lambda_bias
-    inlp_k = args.inlp_iterations
-    if args.weak_debias and args.skip_train:
-        print("  Warning: --weak-debias ignored with --skip-train (checkpoint not retrained)")
-    elif args.weak_debias:
-        train_lambda_bias = 0.15
-        inlp_k = 3
-        print(f"  --weak-debias: B_adv train λ1={train_lambda_bias}, INLP k={inlp_k} (partial suppression regime)")
-
-    # Train/load B_task (B1)
-    print("\n--- Preparing B_task (B1 standard fine-tuning) ---")
-    model_b1 = None
-    if not args.skip_train:
-        model_b1, _, _ = run_b1(
-            train_dataset=train_ds,
-            eval_dataset=val_ds,
-            model_name=args.model,
-            num_labels=NUM_OCCUPATIONS,
-            batch_size=args.batch_size,
-            epochs=args.epochs,
-            lr=DEFAULT_LR,
-            device=device,
-            save_representations=False,
-        )
-    else:
-        ckpt = os.path.join("checkpoints", "b1_standard", "pytorch_model.pt")
-        if not os.path.isfile(ckpt):
-            raise FileNotFoundError(f"Missing checkpoint for --skip-train: {ckpt}")
-        from models.qwen_task import QwenTaskModel
-        model_b1 = QwenTaskModel(model_name=args.model, num_labels=NUM_OCCUPATIONS).to(device)
-        state = torch.load(ckpt, map_location="cpu", weights_only=False)
-        model_b1.load_state_dict(state["model_state_dict"], strict=False)
-
-    # Train/load B_adv (B2 adversarial: L_task + λ1 L_bias, no stability term)
-    print("\n--- Preparing B_adv (B2 adversarial debiasing) ---")
-    model_b2 = None
-    if not args.skip_train:
-        model_b2, _, _ = run_b2(
-            train_dataset=train_ds,
-            eval_dataset=val_ds,
-            model_name=args.model,
-            num_labels=NUM_OCCUPATIONS,
-            num_bias_labels=2,
-            lambda_bias=train_lambda_bias,
-            batch_size=args.batch_size,
-            epochs=args.epochs,
-            lr=DEFAULT_LR,
-            device=device,
-            save_representations=False,
-            use_lora=args.b2_lora,
-            lora_r=args.b2_lora_r,
-            lora_alpha=args.b2_lora_alpha,
-            lora_dropout=args.b2_lora_dropout,
-        )
-    else:
-        ckpt = os.path.join("checkpoints", "b2_adversarial", "pytorch_model.pt")
-        if not os.path.isfile(ckpt):
-            raise FileNotFoundError(f"Missing checkpoint for --skip-train: {ckpt}")
-        model_b2 = load_b2_from_checkpoint(
-            ckpt, args.model, device, NUM_OCCUPATIONS, num_bias_labels=2
-        )
-
-    # Train/load Main (stability-regularized adversarial + LoRA)
-    print("\n--- Preparing Main (stability-regularized) ---")
-    model_main = None
-    if not args.skip_train:
-        model_main, _, _ = run_main(
-            train_dataset=train_ds,
-            eval_dataset=val_ds,
-            model_name=args.model,
-            num_labels=NUM_OCCUPATIONS,
-            num_bias_labels=2,
-            lambda_bias=train_lambda_bias,
-            lambda_stab=args.lambda_stab,
-            inner_lr=args.main_inner_lr,
-            inner_steps=args.main_inner_steps,
-            stab_loss_mode=args.main_stab_loss_mode,
-            batch_size=args.batch_size,
-            epochs=args.epochs,
-            lr=DEFAULT_LR,
-            device=device,
-            save_representations=False,
-            use_lora=args.b2_lora,
-            lora_r=args.b2_lora_r,
-            lora_alpha=args.b2_lora_alpha,
-            lora_dropout=args.b2_lora_dropout,
-        )
-    else:
-        ckpt_candidates = [
-            os.path.join("checkpoints", "main", "pytorch_model.pt"),
-            os.path.join("checkpoints", "b4_stability", "pytorch_model.pt"),
-        ]
-        ckpt_main = next((p for p in ckpt_candidates if os.path.isfile(p)), None)
-        if ckpt_main is not None:
-            model_main = load_main_from_checkpoint(
-                ckpt_main, args.model, device, NUM_OCCUPATIONS, num_bias_labels=2
-            )
-        else:
-            print(
-                f"  (skip) No Main checkpoint (tried {ckpt_candidates[0]} and legacy {ckpt_candidates[1]})."
-            )
-
-    # Train/load B_static_inlp (B3)
-    print("\n--- Preparing B_static_inlp (B3 INLP projection) ---")
-    model_b3 = None
-    if not args.skip_train:
-        model_b3, _, _ = run_b3(
-            train_dataset=train_ds,
-            eval_dataset=val_ds,
-            model_name=args.model,
-            num_labels=NUM_OCCUPATIONS,
-            k_iterations=inlp_k,
-            batch_size=args.batch_size,
-            epochs=args.epochs,
-            lr=DEFAULT_LR,
-            device=device,
-            save_representations=False,
-        )
-    else:
-        ckpt = os.path.join("checkpoints", "b3_inlp", "pytorch_model.pt")
-        if not os.path.isfile(ckpt):
-            raise FileNotFoundError(f"Missing checkpoint for --skip-train: {ckpt}")
-        from models.qwen_task import QwenTaskModel
-        state = torch.load(ckpt, map_location="cpu", weights_only=False)
-        proj = state.get("projection_matrix")
-        model_b3 = QwenTaskModel(model_name=args.model, num_labels=NUM_OCCUPATIONS, projection_matrix=proj).to(device)
-        model_b3.load_state_dict(state["model_state_dict"], strict=False)
-
-    print("\n--- Agentic evaluation on test split ---")
-    eval_kw = dict(
-        tokenizer=tokenizer,
-        dataset=test_ds,
-        batch_size=args.batch_size,
-        max_length=args.max_length,
-        device=device,
-        seed=args.seed,
-        adaptation_steps=args.adaptation_steps,
-        adaptation_lr=args.adaptation_lr,
-        recompute_projection_each_step=args.recompute_projection_each_step,
-        lambda_bias_adapt=args.lambda_bias,
-        adaptation_task_only=args.adaptation_task_only,
-        adaptation_adapt_lora=args.adaptation_adapt_lora,
-        adaptation_grad_clip=args.adaptation_grad_clip,
-        adapt_objective=args.adapt_objective,
-        adapt_lm_max_length=args.adapt_lm_max_length,
-    )
-    results = {}
-    # Core ablation: Main uses same eval entrypoint as B1/B2
-    results["B_task"] = _agentic_eval_for_model(model=model_b1, apply_dynamic_reg=False, **eval_kw)
-    results["B_adv"] = _agentic_eval_for_model(model=model_b2, apply_dynamic_reg=False, **eval_kw)
-    if model_main is not None:
-        results["Main"] = _agentic_eval_for_model(model=model_main, apply_dynamic_reg=False, **eval_kw)
-    # Supporting comparisons
-    results["B_static_inlp"] = _agentic_eval_for_model(model=model_b3, apply_dynamic_reg=False, **eval_kw)
-    results["A2_runtime_dynamic_proj"] = _agentic_eval_for_model(model=model_b1, apply_dynamic_reg=True, **eval_kw)
-
-    if not args.skip_biography_probe:
-        print("\n--- Biography-only probe (suppression regime; same inputs as task training) ---")
-        rows_bio = [
-            ("B_task", model_b1),
-            ("B_adv", model_b2),
-            ("B_static_inlp", model_b3),
-            ("A2_runtime_dynamic_proj", model_b1),
-        ]
-        if model_main is not None:
-            rows_bio.insert(3, ("Main", model_main))
-        for name, m in rows_bio:
-            bio = _biography_probe_dict(m, test_ds, args.batch_size, device, args.seed)
-            _merge_biography_and_lift(results[name], bio)
-            print(f"  {name}: biography R={bio['biography_probe_R']} E={bio['biography_probe_E']}")
-
-    table0_pure_bio_task_ft: Dict[str, Dict] = {}
-    if not args.skip_table0_pure_ft:
-        print("\n--- TABLE 0: Biography adaptation → re-probe gender (ΔE_bio) ---")
-        rows_t0 = [
-            ("B_task", model_b1),
-            ("B_adv", model_b2),
-            ("B_static_inlp", model_b3),
-        ]
-        if model_main is not None:
-            rows_t0.append(("Main", model_main))
-        for name, m in rows_t0:
-            row = _biography_task_finetune_then_Ebio(
-                m,
-                train_ds,
-                test_ds,
-                device,
-                args.batch_size,
-                args.seed,
-                ft_epochs=args.bio_ft_epochs,
-                ft_lr=args.bio_ft_lr,
-                tokenizer=tokenizer,
-                adapt_objective=args.adapt_objective,
-                adapt_lm_max_length=args.adapt_lm_max_length,
-            )
-            table0_pure_bio_task_ft[name] = row
-            print(
-                f"  {name}: E_before={row['E_bio_before_ft']} E_after={row['E_bio_after_bio_ft']} "
-                f"ΔE={row['delta_E_bio_pure_ft']}"
-            )
-
-    meta = {
-        "timestamp": datetime.now().isoformat(),
-        "device": device,
-        "model": args.model,
-        "seed": args.seed,
-        "bios_train": len(train_ds),
-        "bios_val": len(val_ds),
-        "bios_test": len(test_ds),
-        "epochs": args.epochs,
-        "batch_size": args.batch_size,
-        "max_length": args.max_length,
-        "lambda_bias": args.lambda_bias,
-        "lambda_stab": args.lambda_stab,
-        "main_inner_lr": args.main_inner_lr,
-        "main_inner_steps": args.main_inner_steps,
-        "main_stab_loss_mode": args.main_stab_loss_mode,
-        "inlp_iterations": args.inlp_iterations,
-        "inlp_iterations_used": inlp_k,
-        "lambda_bias_train_used": train_lambda_bias,
-        "weak_debias": args.weak_debias,
-        "b2_lora": args.b2_lora,
-        "b2_lora_r": args.b2_lora_r if args.b2_lora else None,
-        "b2_lora_alpha": args.b2_lora_alpha if args.b2_lora else None,
-        "b2_lora_dropout": args.b2_lora_dropout if args.b2_lora else None,
-        "biography_probe": not args.skip_biography_probe,
-        "adaptation_steps": args.adaptation_steps,
-        "adaptation_lr": args.adaptation_lr,
-        "adaptation_task_only": args.adaptation_task_only,
-        "adaptation_adapt_lora": args.adaptation_adapt_lora,
-        "adaptation_grad_clip": args.adaptation_grad_clip,
-        "recompute_projection_each_step": args.recompute_projection_each_step,
-        "adapt_objective": args.adapt_objective,
-        "adapt_lm_max_length": args.adapt_lm_max_length,
-        "core_baselines": ["B_task (L_task)", "B_adv (L_task + λ1 L_bias)", "Main (L_task + λ1 L_bias + λ2 L_stab)"],
-        "supporting_baselines": ["B_static_inlp (INLP)", "A2_runtime_dynamic_proj"],
-        "probe_protocol": "Same sklearn Pipeline(StandardScaler, LogisticRegression) and random_state=seed for R1/R2/R3; 80/20 stratified probe split; scaler fit on probe train only.",
-        "notes": "Main: `run_main` → `checkpoints/main/` (or legacy `checkpoints/b4_stability/` when skip-train). Same `_agentic_eval_for_model` as B1/B2.",
-        "metric_interpretation": [
-            "If R1≈R3≈1.0 for all models, the linear probe is saturated; use excess recoverability E=(R-p*)/(1-p*) and trajectory_delta_excess_R, and/or ROC-AUC.",
-            "INLP projection P is fit on biography-pooled pretrained reps; agent prompts change the input distribution, so gender may remain linearly recoverable (R stays high) unless you align training/eval prompts or refit P on agent trajectories.",
-            "To show debiasing, first verify low R (or low E) on biography-only hidden states; then measure drift after LoRA / inner adaptation / multi-step prompts.",
-            "Biography-only columns in results: debiasing is evaluated on the same tokenized bios as B1/B2/B3. Agentic columns use multi-step prompts (distribution shift).",
-            "Use --weak-debias for an intentional partial-suppression regime (low λ1, few INLP iters) so E_bio stays in (0.2,0.8) and trajectories have headroom.",
-            "B2 default (no --b2-lora): full backbone is trained with AdamW(model.parameters())—GRL updates representations. Agentic inner-loop: task head only (no LoRA).",
-            "B2 with --b2-lora: training freezes base backbone; LoRA + heads train. With adapt_objective='occupation', inner loop uses LoRA+task head on agentic step-1 tokens; with 'summarize_lm', inner loop uses LM loss on raw bios (LoRA only).",
-            "TABLE0 default: causal LM on 'Summarize this biography.' + bio + pseudo-summary; classification heads frozen; re-probe gender on same biography inputs.",
-            "adapt_objective='summarize_lm': task-shift via generation-style objective; debiasing remains 28-way occupation. Gender probe unchanged.",
-        ],
-        "baselines_run": list(results.keys()),
-        "table0_pure_bio_task_ft": not args.skip_table0_pure_ft,
-        "bio_ft_epochs": args.bio_ft_epochs,
-        "bio_ft_lr": args.bio_ft_lr,
-    }
-    report = {"meta": meta, "results": results, "table0_pure_bio_task_ft": table0_pure_bio_task_ft}
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    json_path = os.path.join(RESULTS_DIR, f"agentic_report_{ts}.json")
-    md_path = os.path.join(RESULTS_DIR, f"agentic_report_{ts}.md")
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2)
-
-    md_text = render_agentic_report_markdown(
-        meta,
-        results,
-        table0_pure_bio_task_ft,
-        skip_biography_probe=args.skip_biography_probe,
-    )
-    with open(md_path, "w", encoding="utf-8") as f:
-        f.write(md_text)
-
-    print(f"\nAgentic report JSON: {json_path}")
-    print(f"Agentic report MD:   {md_path}")
-
-
 if __name__ == "__main__":
-    main()
+    print(
+        "This module provides agentic / task-shift evaluation helpers.\n"
+        "  Full pipeline (Bios + CrowS-Pairs + BBQ + agentic TABLE 0–5):  python run_all_baselines.py\n"
+        "  Smaller demo:  python demo/run_demo.py",
+    )
 

@@ -1,40 +1,71 @@
 {
-  "description": "Baseline comparison from run 2026-02-21. R(θ) = probe accuracy on sensitive attribute; ΔR = change in R(θ) after LoRA adaptation.",
-  "generated": "2026-02-21T22:12:18.248015",
+  "description": "Baseline comparison (Bias in Bios). R(\u03b8)=recoverability; R(\u03b8')=after LoRA from that baseline; \u0394R=R(\u03b8')\u2212R(\u03b8).",
+  "generated": "2026-04-09T16:17:58.737263",
   "model": "Qwen/Qwen2.5-0.5B",
   "device": "cuda:9",
   "data": {
-    "controlled_train": 1600,
-    "controlled_eval": 400,
-    "crows_pairs": 1508,
-    "bbq": 1840
+    "bios_train": 5000,
+    "bios_val": 1250,
+    "bios_test": 2500,
+    "crows_pairs": 500,
+    "bbq": 2000
   },
   "baselines": {
+    "B0_pretrained": {
+      "name": "B0 Pretrained",
+      "occupation_accuracy_percent": 6.24,
+      "gender_gap_percent": 2.6213,
+      "R_theta": 0.983,
+      "R_theta_prime": 0.984,
+      "delta_R": 0.001,
+      "crows_pairs_bias_percent": 52.4,
+      "bbq_accuracy_percent": 38.5,
+      "bbq_gap_percent": 0.0
+    },
     "B1_standard": {
-      "name": "No suppression (standard fine-tuning)",
-      "task_accuracy_percent": 100.0,
-      "R_theta": 0.4875,
-      "crows_pairs_bias_percent": 51.33,
-      "bbq_accuracy_percent": 29.4,
+      "name": "B1 Standard",
+      "occupation_accuracy_percent": 79.08,
+      "gender_gap_percent": 1.1435,
+      "R_theta": 0.9648,
+      "R_theta_prime": 0.978,
+      "delta_R": 0.0132,
+      "crows_pairs_bias_percent": 54.6,
+      "bbq_accuracy_percent": 31.35,
       "bbq_gap_percent": 0.0
     },
     "B2_adversarial": {
-      "name": "Adversarial debiasing (GRL)",
-      "task_accuracy_percent": 100.0,
-      "R_theta": 0.5312,
-      "crows_pairs_bias_percent": 50.07,
-      "bbq_accuracy_percent": 25.43,
+      "name": "B2 Adversarial",
+      "occupation_accuracy_percent": 72.92,
+      "gender_gap_percent": 0.6039,
+      "R_theta": 0.879,
+      "R_theta_prime": 0.975,
+      "delta_R": 0.096,
+      "crows_pairs_bias_percent": 54.2,
+      "bbq_accuracy_percent": 46.25,
       "bbq_gap_percent": 0.0
     },
     "B3_INLP": {
-      "name": "INLP (iterative nullspace projection)",
-      "task_accuracy_percent": 75.0,
-      "R_theta": 0.4938,
-      "crows_pairs_bias_percent": 51.92,
-      "bbq_accuracy_percent": 28.91,
+      "name": "B3 Inlp",
+      "occupation_accuracy_percent": 54.64,
+      "gender_gap_percent": 4.6767,
+      "R_theta": 0.928,
+      "R_theta_prime": 0.979,
+      "delta_R": 0.051,
+      "crows_pairs_bias_percent": 52.4,
+      "bbq_accuracy_percent": 38.5,
+      "bbq_gap_percent": 0.0
+    },
+    "Main": {
+      "name": "Main",
+      "occupation_accuracy_percent": 74.16,
+      "gender_gap_percent": 0.1462,
+      "R_theta": 0.855,
+      "R_theta_prime": 0.981,
+      "delta_R": 0.126,
+      "crows_pairs_bias_percent": 49.8,
+      "bbq_accuracy_percent": 46.9,
       "bbq_gap_percent": 0.0
     }
   },
-  "lora_delta_R": 0.0344,
-  "summary": "B1/B2 reach 100% task accuracy; B3 INLP drops to 75%. R(θ) ~49–53% (near chance). CrowS-Pairs bias ~50–52%; BBQ gap 0. LoRA ΔR = +0.0344."
+  "summary": ""
 }

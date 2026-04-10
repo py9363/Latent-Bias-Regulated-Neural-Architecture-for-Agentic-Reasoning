@@ -3,13 +3,14 @@ Run baselines B0–B3 and **Main** (always) on Bias in Bios + CrowS-Pairs + BBQ;
 B1=no suppression, B2=adversarial (static), B3=INLP. **Main** = stability-regularized adversarial (``run_main``, LoRA).
 
 Typical capstone flows (from repo root, PowerShell):
-  python run_agentic_baselines.py
-      Trains B1, B2, Main, B3; agentic multi-step eval, biography probes, TABLE 0–5 → JSON/MD in RESULTS_DIR.
-
   python run_all_baselines.py
-      B0–B3 + **Main** + CrowS/BBQ + LoRA ΔR (unless ``--no-lora``); JSON/MD in RESULTS_DIR.
+      B0–B3 + **Main** + CrowS/BBQ + LoRA ΔR; writes **report_{timestamp}.json/.md** in RESULTS_DIR.
+      Markdown = baseline table + agentic table (B_adv vs Main, E-step notation). Agentic metrics are nested under
+      ``agentic`` in JSON. Use ``--agentic-models all`` to also run A2, INLP
+      (stored in JSON; the printed table still highlights B_adv vs Main).
 
-See ``run_agentic_baselines.py`` docstring for CONFIG (adaptation steps, λ1/λ2, data caps).
+Agentic helpers live in ``run_agentic_baselines.py`` (imported by this script and ``demo/run_demo.py``).
+Adaptation defaults: ``config.py`` (``DEFAULT_ADAPTATION_*``, λ1/λ2, data caps).
 Usage: python run_all_baselines.py [--lambda-bias F] [--lora-r R] [--lora-alpha A] [--no-bias-loss-balance] ...
 """
 import os
@@ -18,14 +19,17 @@ import json
 import argparse
 import random
 from pathlib import Path
+from typing import Optional
 from datetime import datetime
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (
+    DEFAULT_ADAPTATION_LR,
+    DEFAULT_ADAPTATION_STEPS,
     DEFAULT_BATCH_SIZE,
     DEFAULT_EPOCHS,
-    DEFAULT_LAMBDA_BIAS,
+    DEFAULT_INLP_ITERATIONS,
     DEFAULT_LAMBDA_STAB,
     DEFAULT_LORA_ALPHA,
     DEFAULT_LORA_DROPOUT,
@@ -46,6 +50,7 @@ from baselines.b3_inlp import run_b3
 from baselines.main_stability import run_main
 from models.qwen_task import QwenTaskModel
 from evaluation.probe import run_probe
+from evaluation.capstone_report_md import render_capstone_report_markdown
 from evaluation.metrics import (
     compute_occupation_accuracy_and_gender_gap,
     get_backbone_for_lm,
@@ -55,6 +60,16 @@ from evaluation.metrics import (
 
 NUM_OCCUPATIONS = 28
 DEFAULT_SEED = 42
+# Align compute profile with demo defaults.
+RUN_ALL_DEFAULT_BATCH_SIZE = max(16, DEFAULT_BATCH_SIZE)
+RUN_ALL_AGENTIC_ADAPTATION_STEPS = 5
+RUN_ALL_AGENTIC_ADAPTATION_LR = 1e-4
+RUN_ALL_ADAPT_LM_MAX_LENGTH = 256
+# Defaults for full baseline runs (B2 λ1 + Main λ2 / inner loop / grad clip); override B2/Main only here.
+RUN_ALL_LAMBDA_BIAS_DEFAULT = 0.5
+RUN_ALL_LAMBDA_STAB = 0.05
+RUN_ALL_MAIN_INNER_LR = 5e-5
+RUN_ALL_MAIN_GRAD_CLIP_NORM = 0.5
 
 
 def set_seed(seed: int):
@@ -111,17 +126,306 @@ def _bios_subset_for_lora(dataset, tokenizer, max_length: int, subset_size: int 
     return subset.map(add_labels, desc="labels for LoRA")
 
 
+def _collect_agentic_eval_bundle(
+    *,
+    tokenizer,
+    train_ds,
+    val_ds,
+    test_ds,
+    device: str,
+    model_name: str,
+    batch_size: int,
+    max_length: int,
+    seed: int,
+    epochs: int,
+    ckpt_b1: str,
+    ckpt_b2: str,
+    ckpt_b3: str,
+    ckpt_main,
+    lambda_bias_train: float,
+    agentic_models: str = "b_adv",
+    lambda_stab_main: Optional[float] = None,
+    main_inner_lr: Optional[float] = None,
+) -> dict:
+    """
+    Multi-step agentic eval + TABLE 0 biography fine-tune. Always runs **B_task** (normal fine-tuned B1),
+    **B_adv**, and **Main** (when ``ckpt_main`` is set). With ``--agentic-models all``, also runs A2 and B_static_inlp.
+
+    Returns ``{"meta": ..., "results": ordered_dict, "table0_pure_bio_task_ft": ...}`` for JSON / markdown.
+    """
+    import torch
+    from baselines.b2_adversarial import load_b2_from_checkpoint
+    from baselines.main_stability import load_main_from_checkpoint
+    from data.adaptation_labels import ADAPT_OBJECTIVE_SUMMARIZE_LM
+    from run_agentic_baselines import (
+        DEFAULT_ADAPT_LM_MICRO_BATCH,
+        _agentic_eval_for_model,
+        _biography_probe_dict,
+        _biography_task_finetune_then_Ebio,
+        _merge_biography_and_lift,
+    )
+
+    bio_ft_epochs = 3 if len(train_ds) >= 200 else 2
+    bio_ft_lr = 5e-5
+
+    eval_kw = dict(
+        tokenizer=tokenizer,
+        dataset=test_ds,
+        batch_size=batch_size,
+        max_length=max_length,
+        device=device,
+        seed=seed,
+        adaptation_steps=RUN_ALL_AGENTIC_ADAPTATION_STEPS,
+        adaptation_lr=RUN_ALL_AGENTIC_ADAPTATION_LR,
+        recompute_projection_each_step=False,
+        lambda_bias_adapt=lambda_bias_train,
+        adaptation_task_only=True,
+        adaptation_adapt_lora=True,
+        adaptation_grad_clip=1.0,
+        adapt_objective=ADAPT_OBJECTIVE_SUMMARIZE_LM,
+        adapt_lm_max_length=RUN_ALL_ADAPT_LM_MAX_LENGTH,
+        adapt_lm_micro_batch=DEFAULT_ADAPT_LM_MICRO_BATCH,
+    )
+
+    results = {}
+    table0_pure_bio_task_ft = {}
+
+    full_agentic = agentic_models.strip().lower() == "all"
+    print(
+        "\n--- Agentic evaluation (B_task + B_adv + Main for report; JSON may include more with --agentic-models all) ---"
+        + (" [+ A2, INLP]" if full_agentic else "")
+    )
+
+    # B1 → B_task (always); A2 only for full_agentic
+    m1 = QwenTaskModel(model_name=model_name, num_labels=NUM_OCCUPATIONS).to(device)
+    s1 = torch.load(ckpt_b1, map_location="cpu", weights_only=False)
+    m1.load_state_dict(s1["model_state_dict"], strict=False)
+    m1.eval()
+    results["B_task"] = _agentic_eval_for_model(model=m1, apply_dynamic_reg=False, **eval_kw)
+    bio = _biography_probe_dict(m1, test_ds, batch_size, device, seed)
+    _merge_biography_and_lift(results["B_task"], bio)
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+    table0_pure_bio_task_ft["B_task"] = _biography_task_finetune_then_Ebio(
+        m1,
+        train_ds,
+        test_ds,
+        device,
+        batch_size,
+        seed,
+        bio_ft_epochs,
+        bio_ft_lr,
+        tokenizer=tokenizer,
+        adapt_objective=ADAPT_OBJECTIVE_SUMMARIZE_LM,
+        adapt_lm_max_length=RUN_ALL_ADAPT_LM_MAX_LENGTH,
+        adapt_lm_micro_batch=DEFAULT_ADAPT_LM_MICRO_BATCH,
+    )
+    if full_agentic:
+        results["A2_runtime_dynamic_proj"] = _agentic_eval_for_model(
+            model=m1, apply_dynamic_reg=True, **eval_kw
+        )
+        bio = _biography_probe_dict(m1, test_ds, batch_size, device, seed)
+        _merge_biography_and_lift(results["A2_runtime_dynamic_proj"], bio)
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+    del m1
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+
+    # B2 → B_adv (always when agentic report runs)
+    m2 = load_b2_from_checkpoint(ckpt_b2, model_name, device, NUM_OCCUPATIONS, num_bias_labels=2)
+    results["B_adv"] = _agentic_eval_for_model(model=m2, apply_dynamic_reg=False, **eval_kw)
+    bio = _biography_probe_dict(m2, test_ds, batch_size, device, seed)
+    _merge_biography_and_lift(results["B_adv"], bio)
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+    table0_pure_bio_task_ft["B_adv"] = _biography_task_finetune_then_Ebio(
+        m2,
+        train_ds,
+        test_ds,
+        device,
+        batch_size,
+        seed,
+        bio_ft_epochs,
+        bio_ft_lr,
+        tokenizer=tokenizer,
+        adapt_objective=ADAPT_OBJECTIVE_SUMMARIZE_LM,
+        adapt_lm_max_length=RUN_ALL_ADAPT_LM_MAX_LENGTH,
+        adapt_lm_micro_batch=DEFAULT_ADAPT_LM_MICRO_BATCH,
+    )
+    del m2
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+
+    if full_agentic:
+        # B3 → B_static_inlp
+        s3 = torch.load(ckpt_b3, map_location="cpu", weights_only=False)
+        proj = s3.get("projection_matrix")
+        m3 = QwenTaskModel(
+            model_name=model_name, num_labels=NUM_OCCUPATIONS, projection_matrix=proj
+        ).to(device)
+        m3.load_state_dict(s3["model_state_dict"], strict=False)
+        m3.eval()
+        results["B_static_inlp"] = _agentic_eval_for_model(model=m3, apply_dynamic_reg=False, **eval_kw)
+        bio = _biography_probe_dict(m3, test_ds, batch_size, device, seed)
+        _merge_biography_and_lift(results["B_static_inlp"], bio)
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+        table0_pure_bio_task_ft["B_static_inlp"] = _biography_task_finetune_then_Ebio(
+            m3,
+            train_ds,
+            test_ds,
+            device,
+            batch_size,
+            seed,
+            bio_ft_epochs,
+            bio_ft_lr,
+            tokenizer=tokenizer,
+            adapt_objective=ADAPT_OBJECTIVE_SUMMARIZE_LM,
+            adapt_lm_max_length=RUN_ALL_ADAPT_LM_MAX_LENGTH,
+            adapt_lm_micro_batch=DEFAULT_ADAPT_LM_MICRO_BATCH,
+        )
+        del m3
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+    if ckpt_main is not None:
+        print("  Agentic eval: loading Main checkpoint…")
+        mm = load_main_from_checkpoint(
+            ckpt_main, model_name, device, NUM_OCCUPATIONS, num_bias_labels=2
+        )
+        results["Main"] = _agentic_eval_for_model(model=mm, apply_dynamic_reg=False, **eval_kw)
+        bio = _biography_probe_dict(mm, test_ds, batch_size, device, seed)
+        _merge_biography_and_lift(results["Main"], bio)
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+        table0_pure_bio_task_ft["Main"] = _biography_task_finetune_then_Ebio(
+            mm,
+            train_ds,
+            test_ds,
+            device,
+            batch_size,
+            seed,
+            bio_ft_epochs,
+            bio_ft_lr,
+            tokenizer=tokenizer,
+            adapt_objective=ADAPT_OBJECTIVE_SUMMARIZE_LM,
+            adapt_lm_max_length=RUN_ALL_ADAPT_LM_MAX_LENGTH,
+            adapt_lm_micro_batch=DEFAULT_ADAPT_LM_MICRO_BATCH,
+        )
+        del mm
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+    else:
+        print(
+            "  Agentic Main: skipped — no Main checkpoint (ckpt_main is None). "
+            "Train Main successfully or check run_main output path."
+        )
+
+    if full_agentic:
+        ordered_results = {
+            "B_task": results["B_task"],
+            "B_adv": results["B_adv"],
+            "Main": results.get("Main"),
+            "B_static_inlp": results["B_static_inlp"],
+            "A2_runtime_dynamic_proj": results["A2_runtime_dynamic_proj"],
+        }
+        ordered_results = {k: v for k, v in ordered_results.items() if v is not None}
+    else:
+        ordered_results = {"B_task": results["B_task"], "B_adv": results["B_adv"]}
+        if "Main" in results:
+            ordered_results["Main"] = results["Main"]
+
+    meta = {
+        "timestamp": datetime.now().isoformat(),
+        "device": device,
+        "model": model_name,
+        "seed": seed,
+        "bios_train": len(train_ds),
+        "bios_val": len(val_ds),
+        "bios_test": len(test_ds),
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "max_length": max_length,
+        "lambda_bias": lambda_bias_train,
+        "lambda_stab": lambda_stab_main if lambda_stab_main is not None else DEFAULT_LAMBDA_STAB,
+        "lambda_bias_train_used": lambda_bias_train,
+        "inlp_iterations": DEFAULT_INLP_ITERATIONS,
+        "inlp_iterations_used": DEFAULT_INLP_ITERATIONS,
+        "main_inner_lr": main_inner_lr if main_inner_lr is not None else DEFAULT_MAIN_INNER_LR,
+        "main_inner_steps": DEFAULT_MAIN_INNER_STEPS,
+        "main_stab_loss_mode": "kl",
+        "biography_probe": True,
+        "adaptation_steps": RUN_ALL_AGENTIC_ADAPTATION_STEPS,
+        "adaptation_lr": RUN_ALL_AGENTIC_ADAPTATION_LR,
+        "adaptation_task_only": True,
+        "adaptation_adapt_lora": True,
+        "adaptation_grad_clip": 1.0,
+        "recompute_projection_each_step": False,
+        "adapt_objective": ADAPT_OBJECTIVE_SUMMARIZE_LM,
+        "adapt_lm_max_length": RUN_ALL_ADAPT_LM_MAX_LENGTH,
+        "source_script": "run_all_baselines.py",
+        "probe_protocol": (
+            "Same sklearn Pipeline(StandardScaler, LogisticRegression) and random_state=seed for R1/R2/R3; "
+            "80/20 stratified probe split; scaler fit on probe train only."
+        ),
+        "metric_interpretation": [
+            "E_bio, E1–E3: excess recoverability; ΔE = E3−E1. See evaluation/capstone_report_md.py.",
+        ],
+        "baselines_run": list(ordered_results.keys()),
+        "table0_pure_bio_task_ft": True,
+        "bio_ft_epochs": bio_ft_epochs,
+        "bio_ft_lr": bio_ft_lr,
+        "agentic_models": agentic_models,
+    }
+
+    return {
+        "meta": meta,
+        "results": ordered_results,
+        "table0_pure_bio_task_ft": table0_pure_bio_task_ft,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run all baselines and produce report")
-    parser.add_argument("--crows-max", type=int, default=None, help="Max CrowS-Pairs examples (default: all)")
-    parser.add_argument("--bbq-max", type=int, default=None, help="Max BBQ examples (default: all)")
+    parser.add_argument(
+        "--crows-max",
+        type=int,
+        default=500,
+        help="Max CrowS-Pairs examples for eval (default: 500)",
+    )
+    parser.add_argument(
+        "--bbq-max",
+        type=int,
+        default=2000,
+        help="Max BBQ examples for eval (default: 2000; full test split is ~31k+)",
+    )
     parser.add_argument("--max-length", type=int, default=256, help="Max sequence length for Bias in Bios")
-    parser.add_argument("--bios-train-max", type=int, default=10000, help="Cap Bias in Bios train size (default: 10000)")
-    parser.add_argument("--bios-val-max", type=int, default=5000, help="Cap Bias in Bios val size (default: 5000)")
-    parser.add_argument("--bios-test-max", type=int, default=10000, help="Cap Bias in Bios test size for eval (default: 10000)")
+    parser.add_argument(
+        "--bios-train-max",
+        type=int,
+        default=5000,
+        help="Cap Bias in Bios train size (default: 5000)",
+    )
+    parser.add_argument(
+        "--bios-val-max",
+        type=int,
+        default=1250,
+        help="Cap Bias in Bios val size (default: 1250)",
+    )
+    parser.add_argument(
+        "--bios-test-max",
+        type=int,
+        default=2500,
+        help="Cap Bias in Bios test size for eval (default: 2500)",
+    )
     parser.add_argument("--epochs", type=int, default=None, help="Training epochs (default: config)")
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument("--no-lora", action="store_true", help="Skip LoRA adaptation and delta_R")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=RUN_ALL_DEFAULT_BATCH_SIZE,
+        help=f"Train/eval batch size (default: {RUN_ALL_DEFAULT_BATCH_SIZE}, aligned with demo compute)",
+    )
     parser.add_argument("--quick", action="store_true", help="Quick run: subset Bios train, 200 crows, 200 bbq, 2 epochs")
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help=f"Random seed for reproducibility (default: {DEFAULT_SEED})")
@@ -129,7 +433,7 @@ def main():
         "--lambda-bias",
         type=float,
         default=None,
-        help=f"Adversarial λ1 for B2 + Main (default: {DEFAULT_LAMBDA_BIAS}; try 2.0 for stronger pressure)",
+        help=f"Adversarial λ1 for B2 + Main (default: {RUN_ALL_LAMBDA_BIAS_DEFAULT})",
     )
     parser.add_argument(
         "--lora-r",
@@ -148,22 +452,27 @@ def main():
         action="store_true",
         help="Disable per-batch L_task/L_bias magnitude scaling on the adversarial term",
     )
+    parser.add_argument(
+        "--agentic-models",
+        type=str,
+        choices=["b_adv", "all"],
+        default="b_adv",
+        help="Extra agentic models in JSON: b_adv = B_task+B_adv+Main (default); all = also A2, INLP",
+    )
     args = parser.parse_args()
 
     set_seed(args.seed)
     print(f"Random seed set to {args.seed}")
 
     if args.quick:
-        if args.crows_max is None:
-            args.crows_max = 200
-        if args.bbq_max is None:
-            args.bbq_max = 200
+        args.crows_max = 200
+        args.bbq_max = 200
         if args.epochs is None:
             args.epochs = 2
     if args.epochs is None:
         args.epochs = DEFAULT_EPOCHS
 
-    lambda_bias_train = args.lambda_bias if args.lambda_bias is not None else DEFAULT_LAMBDA_BIAS
+    lambda_bias_train = args.lambda_bias if args.lambda_bias is not None else RUN_ALL_LAMBDA_BIAS_DEFAULT
     lora_r_train = args.lora_r if args.lora_r is not None else DEFAULT_LORA_R
     lora_alpha_train = args.lora_alpha if args.lora_alpha is not None else DEFAULT_LORA_ALPHA
     balance_bias_loss = not args.no_bias_loss_balance
@@ -184,10 +493,10 @@ def main():
     if args.quick and len(train_ds) > 5000:
         train_ds = train_ds.select(range(5000))
     if args.quick:
-        if len(val_ds) > 1000:
-            val_ds = val_ds.select(range(1000))
-        if len(test_ds) > 2000:
-            test_ds = test_ds.select(range(2000))
+        if len(val_ds) > 2500:
+            val_ds = val_ds.select(range(2500))
+        if len(test_ds) > 5000:
+            test_ds = test_ds.select(range(5000))
     if args.bios_train_max is not None and len(train_ds) > args.bios_train_max:
         train_ds = train_ds.select(range(args.bios_train_max))
     if args.bios_val_max is not None and len(val_ds) > args.bios_val_max:
@@ -386,7 +695,7 @@ def main():
         num_labels=NUM_OCCUPATIONS,
         num_bias_labels=2,
         lambda_bias=lambda_bias_train,
-        lambda_stab=DEFAULT_LAMBDA_STAB,
+        lambda_stab=RUN_ALL_LAMBDA_STAB,
         batch_size=args.batch_size,
         epochs=args.epochs,
         lr=DEFAULT_LR,
@@ -396,9 +705,10 @@ def main():
         lora_r=lora_r_train,
         lora_alpha=lora_alpha_train,
         lora_dropout=DEFAULT_LORA_DROPOUT,
-        inner_lr=DEFAULT_MAIN_INNER_LR,
+        inner_lr=RUN_ALL_MAIN_INNER_LR,
         inner_steps=DEFAULT_MAIN_INNER_STEPS,
         balance_bias_loss=balance_bias_loss,
+        grad_clip_norm=RUN_ALL_MAIN_GRAD_CLIP_NORM,
     )
     occ_m = compute_occupation_accuracy_and_gender_gap(
         model_main, test_ds, device=device, batch_size=args.batch_size, collate_fn=_collate_batch
@@ -427,67 +737,65 @@ def main():
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
 
-    # ---- LoRA from each baseline (optional): R(θ), R(θ'), ΔR per baseline ----
-    if not args.no_lora:
-        from adaptation.lora_adaptation import (
-            run_lora_from_baseline_checkpoint,
-            extract_hidden_after_lora,
-        )
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-        lora_adaptation_dataset = _bios_subset_for_lora(
-            train_ds, tokenizer, args.max_length, subset_size=2000, pad_token_id=pad_id
-        )
-        baselines_for_lora = [
-            ("B0_pretrained", None, "b0"),  # no checkpoint: use pretrained weights as-is
-            ("B1_standard", ckpt_b1, "b1"),
-            ("B2_adversarial", ckpt_b2, "b2"),
-            ("B3_INLP", ckpt_b3, "b3"),
-        ]
-        if ckpt_main is not None:
-            baselines_for_lora.append(("Main", ckpt_main, "main"))
-        for key, ckpt_path, base_name in baselines_for_lora:
-            if key not in results:
-                continue
-            print(f"\n--- LoRA from {key} ---")
-            adapted_model = None
-            try:
-                adapted_model, _ = run_lora_from_baseline_checkpoint(
-                    baseline_checkpoint_path=ckpt_path,
-                    base_model_name=args.model,
-                    adaptation_dataset=lora_adaptation_dataset,
-                    baseline_name=base_name,
-                    epochs=2,
-                    lr=1e-4,
-                    batch_size=4,
-                    max_length=args.max_length,
-                    device=device,
-                )
-                h_adapted, s_adapted = extract_hidden_after_lora(
-                    adapted_model, tokenizer, train_ds,
-                    batch_size=args.batch_size, device=device,
-                )
-                probe_adapted = run_probe(
-                    h_adapted.numpy() if hasattr(h_adapted, "numpy") else h_adapted.cpu().numpy(),
-                    s_adapted, test_size=0.2, random_state=args.seed,
-                )
-                R_theta_prime = round(probe_adapted["accuracy"], 4)
-                R_theta = results[key]["recoverability_R"]
-                delta_R = round(R_theta_prime - R_theta, 4)
-                results[key]["R_theta_prime"] = R_theta_prime
-                results[key]["delta_R"] = delta_R
-                print(f"  {key}: R(θ)={R_theta} → R(θ')={R_theta_prime}, ΔR={delta_R}")
-            except Exception as e:
-                print(f"  LoRA from {key} failed: {e}")
-                results[key]["R_theta_prime"] = None
-                results[key]["delta_R"] = None
-            if adapted_model is not None:
-                del adapted_model
-            if device.startswith("cuda"):
-                torch.cuda.empty_cache()
+    # ---- LoRA from each baseline: R(θ), R(θ'), ΔR per baseline ----
+    from adaptation.lora_adaptation import (
+        run_lora_from_baseline_checkpoint,
+        extract_hidden_after_lora,
+    )
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    lora_adaptation_dataset = _bios_subset_for_lora(
+        train_ds, tokenizer, args.max_length, subset_size=2000, pad_token_id=pad_id
+    )
+    baselines_for_lora = [
+        ("B0_pretrained", None, "b0"),  # no checkpoint: use pretrained weights as-is
+        ("B1_standard", ckpt_b1, "b1"),
+        ("B2_adversarial", ckpt_b2, "b2"),
+        ("B3_INLP", ckpt_b3, "b3"),
+    ]
+    if ckpt_main is not None:
+        baselines_for_lora.append(("Main", ckpt_main, "main"))
+    for key, ckpt_path, base_name in baselines_for_lora:
+        if key not in results:
+            continue
+        print(f"\n--- LoRA from {key} ---")
+        adapted_model = None
+        try:
+            adapted_model, _ = run_lora_from_baseline_checkpoint(
+                baseline_checkpoint_path=ckpt_path,
+                base_model_name=args.model,
+                adaptation_dataset=lora_adaptation_dataset,
+                baseline_name=base_name,
+                epochs=2,
+                lr=1e-4,
+                batch_size=4,
+                max_length=args.max_length,
+                device=device,
+            )
+            h_adapted, s_adapted = extract_hidden_after_lora(
+                adapted_model, tokenizer, train_ds,
+                batch_size=args.batch_size, device=device,
+            )
+            probe_adapted = run_probe(
+                h_adapted.numpy() if hasattr(h_adapted, "numpy") else h_adapted.cpu().numpy(),
+                s_adapted, test_size=0.2, random_state=args.seed,
+            )
+            R_theta_prime = round(probe_adapted["accuracy"], 4)
+            R_theta = results[key]["recoverability_R"]
+            delta_R = round(R_theta_prime - R_theta, 4)
+            results[key]["R_theta_prime"] = R_theta_prime
+            results[key]["delta_R"] = delta_R
+            print(f"  {key}: R(θ)={R_theta} → R(θ')={R_theta_prime}, ΔR={delta_R}")
+        except Exception as e:
+            print(f"  LoRA from {key} failed: {e}")
+            results[key]["R_theta_prime"] = None
+            results[key]["delta_R"] = None
+        if adapted_model is not None:
+            del adapted_model
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
 
     # ---- Report ----
     meta = {
-        "timestamp": datetime.now().isoformat(),
         "device": device,
         "model": args.model,
         "seed": args.seed,
@@ -504,43 +812,74 @@ def main():
         "lora_alpha": lora_alpha_train,
         "bias_head": "mlp",
         "bias_loss_balance": balance_bias_loss,
+        "lambda_stab": RUN_ALL_LAMBDA_STAB,
+        "main_inner_lr": RUN_ALL_MAIN_INNER_LR,
+        "main_grad_clip_norm": RUN_ALL_MAIN_GRAD_CLIP_NORM,
     }
-    report = {"meta": meta, "results": results}
-
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    meta["timestamp"] = datetime.now().isoformat()  # after training + optional agentic
     json_path = os.path.join(RESULTS_DIR, f"report_{ts}.json")
     md_path = os.path.join(RESULTS_DIR, f"report_{ts}.md")
-    with open(json_path, "w") as f:
-        json.dump(report, f, indent=2)
+
+    agentic_bundle = None
+    try:
+        agentic_bundle = _collect_agentic_eval_bundle(
+            tokenizer=tokenizer,
+            train_ds=train_ds,
+            val_ds=val_ds,
+            test_ds=test_ds,
+            device=device,
+            model_name=args.model,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            seed=args.seed,
+            epochs=args.epochs,
+            ckpt_b1=ckpt_b1,
+            ckpt_b2=ckpt_b2,
+            ckpt_b3=ckpt_b3,
+            ckpt_main=ckpt_main,
+            lambda_bias_train=lambda_bias_train,
+            agentic_models=args.agentic_models,
+            lambda_stab_main=RUN_ALL_LAMBDA_STAB,
+            main_inner_lr=RUN_ALL_MAIN_INNER_LR,
+        )
+    except Exception as e:
+        print(f"\nWarning: agentic eval failed ({e}); writing baseline-only report.")
+
+    md_body = render_capstone_report_markdown(
+        meta,
+        results,
+        agentic_meta=agentic_bundle["meta"] if agentic_bundle else None,
+        agentic_results=agentic_bundle["results"] if agentic_bundle else None,
+        table0=agentic_bundle["table0_pure_bio_task_ft"] if agentic_bundle else None,
+        skip_table0=False,
+        title="Run-all report (Bias in Bios + CrowS + BBQ + agentic)",
+    )
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(md_body)
+    print(f"Report MD:   {md_path}")
+
+    # Demo-style JSON payload shape, but under results/
+    report_payload: dict = {
+        "timestamp_utc": datetime.now().isoformat(),
+        "meta": meta,
+        "results": results,
+        "agentic_report": None if agentic_bundle is None else agentic_bundle,
+        "report_markdown": md_path,
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(report_payload, f, indent=2)
     print(f"\nReport JSON: {json_path}")
 
-    # Markdown table
-    lines = [
-        "# Baseline Report (Bias in Bios)",
-        "",
-        f"**Generated:** {meta['timestamp']}",
-        f"**Model:** {meta['model']} | **Device:** {meta['device']}",
-        f"**Data:** Bios train={meta['bios_train']} val={meta['bios_val']} test={meta['bios_test']} | CrowS={meta['crows_examples']} | BBQ={meta['bbq_examples']}",
-        "",
-        "| Baseline | Occupation Acc % | Gender gap % | R(θ) | R(θ') | ΔR | CrowS-Pairs bias % | BBQ Acc | BBQ gap |",
-        "|----------|------------------|---------------|------|-------|-----|---------------------|---------|---------|",
-    ]
-    for name, r in results.items():
-        occ_acc = r.get("occupation_accuracy", "")
-        gender_gap = r.get("gender_gap", "")
-        R = r.get("recoverability_R", "")
-        R_prime = r.get("R_theta_prime", "")
-        delta_R = r.get("delta_R", "")
-        crows = r.get("crows_pairs_bias_score", "")
-        bbq_acc = r.get("bbq_task_accuracy", "")
-        bbq_gap = r.get("bbq_accuracy_gap", "")
-        lines.append(f"| {name} | {occ_acc} | {gender_gap} | {R} | {R_prime} | {delta_R} | {crows} | {bbq_acc} | {bbq_gap} |")
-    lines.append("")
-    lines.append("R(θ) = recoverability (probe accuracy on gender); R(θ') = after LoRA adaptation from that baseline; ΔR = R(θ') − R(θ).")
-    lines.append("")
-    with open(md_path, "w") as f:
-        f.write("\n".join(lines))
-    print(f"Report MD:   {md_path}")
+    # Stable latest paths (same style as demo naming)
+    latest_json_path = os.path.join(RESULTS_DIR, "run_all_full_report.json")
+    latest_md_path = os.path.join(RESULTS_DIR, "run_all_report.md")
+    with open(latest_json_path, "w", encoding="utf-8") as f:
+        json.dump(report_payload, f, indent=2)
+    with open(latest_md_path, "w", encoding="utf-8") as f:
+        f.write(md_body)
+    print(f"Latest JSON: {latest_json_path}")
+    print(f"Latest MD:   {latest_md_path}")
 
     # Update baseline_comparison.json for easy reference (R(θ), R(θ'), ΔR per baseline)
     comparison = {
@@ -574,6 +913,7 @@ def main():
     with open(comparison_path, "w") as f:
         json.dump(comparison, f, indent=2)
     print(f"Updated: {comparison_path}")
+
     print("\nDone.")
 
 

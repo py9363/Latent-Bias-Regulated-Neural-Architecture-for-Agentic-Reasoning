@@ -32,21 +32,19 @@ PROBE_C = 1.0  # sklearn LogisticRegression C
 PROBE_MAX_ITER = 10000  # increased for convergence after scaling
 
 # Baselines — adversarial λ1 and LoRA (stronger defaults: nonlinear bias head + scale; see models/adversarial.py)
-DEFAULT_LAMBDA_BIAS = 1.0
+DEFAULT_LAMBDA_BIAS = 2.0
 DEFAULT_LAMBDA_STAB = 0.1   # Main model: stability term weight λ2
-# LoRA capacity + dropout (try r=64, α=128; increase for more representational freedom)
-DEFAULT_LORA_R = 64
-DEFAULT_LORA_ALPHA = 128
+# LoRA capacity + dropout (r=32, α=64; override via CLI / CONFIG)
+DEFAULT_LORA_R = 32
+DEFAULT_LORA_ALPHA = 64
 DEFAULT_LORA_DROPOUT = 0.1
 # When L_task >> L_bias, scale λ1*L_bias per batch so the adversary is not ignored (detached ratio).
 DEFAULT_ADV_BIAS_LOSS_BALANCE = True
 # Agentic inner loop + Main simulated adaptation (strong updates, L_task-only in eval when enabled)
 DEFAULT_ADAPTATION_STEPS = 10
 DEFAULT_ADAPTATION_LR = 1e-4
-DEFAULT_MAIN_INNER_STEPS = 8
+DEFAULT_MAIN_INNER_STEPS = 4  # Main stability: simulated inner SGD steps per batch
 DEFAULT_MAIN_INNER_LR = 1e-4
-DEFAULT_ALPHA_BIAS = 0.3   # B4 bias loss weight
-DEFAULT_BETA_ORTH = 0.1    # B4 orthogonality weight
 
 def get_device():
     """Return device string: cuda:CUDA_DEVICE_ID if set and CUDA available, else cuda:0 or cpu."""

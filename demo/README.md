@@ -47,7 +47,7 @@ python demo/run_demo.py --full-debias
 |------|----------|
 | `demo/output/demo_log.txt` | Console log (tee) |
 | `demo/output/demo_full_report.json` | Meta, bios-split metrics, optional agentic block, paths |
-| `demo/output/demo_agentic_report.md` | Same TABLE 0–5 structure as full `run_agentic_baselines.py` (tiny split) |
+| `demo/output/demo_agentic_report.md` | Same TABLE 0–5 structure as `run_all_baselines.py` agentic bundle (shared helpers in `run_agentic_baselines.py`) |
 | `demo/output/demo_agentic_report.json` | Machine-readable agentic metrics |
 | `demo/output/checkpoints/{b1,b2,b3,main}_demo/` | Checkpoints from each trained stage |
 | `demo/data/sample_batch.json` | First few examples: text preview, occupation id, gender label |

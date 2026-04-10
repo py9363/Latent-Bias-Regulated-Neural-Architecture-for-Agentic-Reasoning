@@ -72,6 +72,7 @@ class QwenAdversarialModel(nn.Module):
         bias_labels: Optional[torch.Tensor] = None,
         return_hidden: bool = False,  # accepted for API parity with QwenTaskModel (hidden always returned)
     ) -> dict:
+        # CausalLMOutputWithPast has no last_hidden_state; use final layer from hidden_states (same as QwenTaskModel).
         outputs = self.backbone(
             input_ids=input_ids,
             attention_mask=attention_mask,
