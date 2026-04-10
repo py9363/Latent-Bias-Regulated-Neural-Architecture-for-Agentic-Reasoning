@@ -93,6 +93,29 @@ Core stack: `torch`, `transformers`, `datasets`, `peft`, `scikit-learn`, `numpy`
 Loaders cache splits on first use. For schema without downloading the full corpus, see `data/samples/bias_in_bios_example.json` and `data/samples/README.md`.
 
 **Figures** (example plots): `results/figures/gender_distribution.png`, `results/figures/occupation_distribution.png`. Regenerate with:
+**Dataset statistics (optional):**
+
+```bash
+python scripts/run_bias_in_bios_stats.py
+```
+
+### Dataset distributions (figures)
+
+Committed plots under **`results/figures/`** (Bias in Bios, predefined splits; counts depend on caps when the script ran).
+
+**Gender (train)** — `results/figures/gender_distribution.png`
+
+<p align="center">
+  <img src="./results/figures/gender_distribution.png" alt="Bias in Bios: gender distribution on train split" width="520" />
+</p>
+
+**Occupation (train, 28 classes)** — `results/figures/occupation_distribution.png`
+
+<p align="center">
+  <img src="./results/figures/occupation_distribution.png" alt="Bias in Bios: occupation counts on train split" width="720" />
+</p>
+
+**Regenerate plots** (default output names: `bias_in_bios_split_sizes.png`, `bias_in_bios_gender_train.png`, `bias_in_bios_occupation_train.png` in `results/figures/`):
 
 ```bash
 python scripts/plot_bias_in_bios_data.py
